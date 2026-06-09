@@ -1,0 +1,35 @@
+data:
+  cohort_csv: "NKI_FreeSurfer/cohort_longitudinal.csv"
+  feature_dir: "outputs/features"
+  fs_roi_file: "features__model-freesurfer_roi__scaler-none__channels-all_roi__seed-0.npz"
+  # CNN: all .npz files NOT matching model-freesurfer_roi (all 120 variants)
+  fs_root: "NKI_FreeSurfer/freesurfer"  # root containing sub-{id}_ses-{session}/ folders (for Arm B2 eTIV)
+  band_map:
+    Longitudinal_Child: Child
+    Longitudinal_Adult: Adult
+
+output:
+  result_dir: "brainage_agg/outputs"
+
+seeds:
+  t_mid: 42       # frozen RNG seed for t_mid sampling — must not change after first run
+  cv_outer: 0     # seed passed to GroupKFold for reproducible fold ordering
+
+cv:
+  n_outer_folds: 5
+  n_inner_folds: 3
+  ridge_alphas: [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+
+lme:
+  # Use statsmodels MixedLM for feature sets with <= this many features (e.g. FS ROI = 657).
+  # Above the threshold, use vectorized per-subject OLS slopes (documented fallback per plan §3).
+  use_statsmodels_threshold: 0
+
+targets:
+  # Arm B target: PC1 of per-subject annualized FS ROI change vectors.
+  # Seed must not change after first run — it controls PCA orientation (sign convention).
+  brain_change_rate_pca_seed: 42
+  # ICV-corrected counterpart used to correct volume features (aseg + GrayVol) before PCA.
+  # Non-volume features (thickness, area, curvature) are taken from fs_roi_file unchanged.
+  # Omit this key to skip ICV correction entirely.
+  brain_change_rate_icv_file: "features__model-freesurfer_roi__scaler-icv__channels-all_roi__seed-0.npz"

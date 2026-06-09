@@ -1,0 +1,32 @@
+# --- Large data outputs (never version raw data or extracted features) ---
+outputs/
+PPMI_data/
+brainage_agg/features/
+brainage_agg/outputs/
+brainage_agg/ppmi_outputs/
+
+# NKI_FreeSurfer is a datalad repo; commit only the cohort metadata files,
+# not the binary FreeSurfer outputs under freesurfer/
+NKI_FreeSurfer/freesurfer/
+
+# --- Python artifacts ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# --- Temporary / agent / editor state ---
+slurm-*.out
+brainage_agg/slurm/logs/
+.agents/
+.codex/
+.claude/
+.DS_Store
+*.swp
+
+# --- Notebooks: keep .ipynb files, but outputs are stripped before commit ---
+# (run: jupyter nbconvert --clear-output --inplace <notebook>.ipynb)

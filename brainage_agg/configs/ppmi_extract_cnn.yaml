@@ -1,0 +1,43 @@
+# CNN feature extraction config for PPMI dataset.
+# Uses raw T1w NIfTI images (no skull-stripping available).
+# mask_path is empty in the cohort CSV → datasets.py falls back to img > 0 mask.
+# This matches the zscore_nonzero approach used in the cnn-long-pd pipeline.
+
+data:
+  cohort_csv: "PPMI_data/cohort_longitudinal.csv"
+  use_csv_paths: true   # read image_path/mask_path from CSV, not freesurfer_root/directory/image_file
+
+output:
+  feature_dir: "PPMI_data/features"
+
+# Match NKI benchmark seed / scaler / feature-set coverage exactly so extractors are comparable.
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+preprocessing:
+  clip_low: 1
+  clip_high: 99
+  rank_size: 3
+
+cnn:
+  in_channels: 3
+  use_norm: true
+  activation: "leaky_relu"
+  init: "xavier"
+  batch_size: 1
+  num_workers: 0
+  device: "cuda"
+
+feature_sets:
+  - name: "t1"
+    channels: ["t1"]
+  - name: "t1_sobel"
+    channels: ["t1", "sobel"]
+  - name: "t1_rank_sobel"
+    channels: ["t1", "rank", "sobel"]
+  - name: "t1_median_sobel"
+    channels: ["t1", "median", "sobel"]
+
+scalers:
+  - "zscore"
+  - "robust"
+  - "minmax"

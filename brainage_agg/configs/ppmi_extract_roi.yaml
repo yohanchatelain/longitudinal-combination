@@ -1,0 +1,10 @@
+# FreeSurfer ROI feature extraction config for PPMI dataset.
+# Uses Desikan-Killiany atlas (lh/rh.aparc.stats) — harmonized with NKI.
+# Reads directly from FreeSurfer stats files in ppmi/<directory>/stats/.
+
+data:
+  freesurfer_root: "ppmi"
+  cohort_csv: "PPMI_data/cohort_longitudinal.csv"
+
+output:
+  feature_dir: "PPMI_data/features"
