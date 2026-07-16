@@ -1,6 +1,7 @@
 # --- Large data outputs (never version raw data or extracted features) ---
 outputs/
 PPMI_data/
+/ppmi/
 brainage_agg/features/
 brainage_agg/outputs/
 brainage_agg/ppmi_outputs/
