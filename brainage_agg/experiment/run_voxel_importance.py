@@ -4,11 +4,14 @@ Computes per-region importance comparable to FS ROI group-diff results
 (features_fs_roi_<agg>.csv). For each aggregation type and each CNN seed:
 
   1. Build per-subject aggregated CNN feature vectors.
-  2. Run Welch t-test (Child vs Adult / PD vs HC) → feature-level t-statistics w.
-  3. Back-propagate w through the frozen CNN for each sampled subject to get
-     voxel-level attribution maps (signed and absolute).
+  2. Derive feature-level importance weight vector(s) w (Child vs Adult / PD vs
+     HC), one per --weight-types entry: 'tstat' (Welch t-statistic, default),
+     'shap' (signed mean TreeSHAP), 'hybrid' (RF permutation-importance x sign).
+  3. Back-propagate each w through the frozen CNN for each sampled subject (one
+     shared forward pass per subject) to get voxel-level attribution maps
+     (signed and absolute).
   4. Project maps to brain regions via aparc+aseg atlas from FreeSurfer.
-  5. Average across subjects and seeds; save CSVs and plots.
+  5. Average across subjects and seeds; save CSVs and plots, tagged by weight type.
 
 Usage:
     python -m brainage_agg.experiment.run_voxel_importance
@@ -16,6 +19,8 @@ Usage:
         --dataset nki --arch double_conv --scaler minmax --channels t1_rank_sobel \\
         --n-subjects 50 --n-seeds 5 --agg mean annualized_rate --save-voxel-map
     python -m brainage_agg.experiment.run_voxel_importance --dataset ppmi --skip-lme
+    python -m brainage_agg.experiment.run_voxel_importance \\
+        --weight-types tstat shap hybrid --n-seeds 2
 """
 from __future__ import annotations
 
@@ -36,15 +41,27 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from brainage_agg.analysis.voxel_attribution import (
-    compute_attribution_map,
+    backprop_from_w,
+    forward_cache,
     load_freesurfer_lut,
     project_to_atlas,
     subject_parcellation_path,
 )
+from brainage_agg.analysis.importance_weights import (
+    compute_w_hybrid,
+    compute_w_shap,
+    compute_w_t,
+    fit_rf,
+    rank_normalize,
+)
+from brainage_agg.analysis.permutation_null import (
+    WelfordAccumulator,
+    derive_threshold,
+    null_correction,
+)
 from brainage_agg.analysis.group_diff import (
     _get_dataset_config,
     build_aggregated_vectors,
-    run_option2_ttest,
 )
 from brainage_agg.agg.aggregations import AGGREGATION_SPECS
 from brainage_agg.agg.lme import make_lme_estimator
@@ -87,21 +104,22 @@ def _find_npz_files(feature_dir: Path, arch: str, scaler: str, channels: str) ->
 
 
 # ---------------------------------------------------------------------------
-# Importance weights (t-statistics) from group-difference analysis
+# Per-seed aggregated features and importance weights
 # ---------------------------------------------------------------------------
 
-def _compute_importance_weights(
+def _build_aggregated_features(
     npz_path: Path,
     manifest: pd.DataFrame,
     aggregation: str,
     groups: tuple[str, str],
-) -> np.ndarray | None:
-    """Return per-CNN-feature t-statistics for one extractor × aggregation.
+) -> tuple[np.ndarray, np.ndarray, int] | None:
+    """Return (X_agg, bands_agg, seed) for one extractor × aggregation.
 
     Returns None if there is insufficient data for this aggregation.
     """
     spec = AGGREGATION_SPECS[aggregation]
-    X_npz, meta_df, _ = load_features(npz_path)
+    X_npz, meta_df, meta = load_features(npz_path)
+    seed = meta["seed"]
     subject_data = align_to_manifest(X_npz, meta_df, manifest)
     n_feat = X_npz.shape[1]
 
@@ -140,8 +158,125 @@ def _compute_importance_weights(
     if len(X_agg) < 6 or X_agg.shape[1] == 0:
         return None
 
-    ttest_df = run_option2_ttest(X_agg, bands_agg, feature_names=None, groups=groups)
-    return ttest_df["t_stat"].values.astype(np.float32)
+    return X_agg, bands_agg, seed
+
+
+def _compute_seed_weights(
+    X_agg: np.ndarray,
+    bands_agg: np.ndarray,
+    groups: tuple[str, str],
+    weight_types: list[str],
+    seed: int,
+    rf_n_estimators: int = 200,
+    rf_permutation_repeats: int = 10,
+    rf_min_samples_leaf: int = 5,
+    verbose: bool = True,
+) -> dict[str, np.ndarray]:
+    """Compute raw (pre-standardization) importance weight vectors.
+
+    One RandomForestClassifier (random_state=seed) backs both 'shap' and
+    'hybrid' if either is requested. 'hybrid' diagnostics (oob_score,
+    train_acc, imp_nonzero_frac) are printed (if verbose) for the Phase 1
+    sanity check — a degenerate (~0) imp_nonzero_frac on real data signals
+    an overfit RF. `verbose=False` suppresses this (used for the Phase 4b
+    permutation-null refits, which call this N times per seed).
+    """
+    weights: dict[str, np.ndarray] = {}
+
+    if "tstat" in weight_types:
+        weights["tstat"] = compute_w_t(X_agg, bands_agg, groups)
+
+    rf = None
+    if "shap" in weight_types or "hybrid" in weight_types:
+        rf = fit_rf(
+            X_agg, bands_agg, groups, seed,
+            n_estimators=rf_n_estimators, min_samples_leaf=rf_min_samples_leaf,
+        )
+
+    if "shap" in weight_types:
+        weights["shap"] = compute_w_shap(rf, X_agg, groups)
+
+    if "hybrid" in weight_types:
+        w_hybrid, diagnostics = compute_w_hybrid(
+            rf, X_agg, bands_agg, groups,
+            n_repeats=rf_permutation_repeats, seed=seed,
+        )
+        weights["hybrid"] = w_hybrid
+        if verbose:
+            print()  # newline after the "Importance weights: ... " progress prefix
+            print(
+                f"      [hybrid seed={seed}] oob_score={diagnostics['oob_score']:.3f} "
+                f"train_acc={diagnostics['train_acc']:.3f} "
+                f"imp_nonzero_frac={diagnostics['imp_nonzero_frac']:.3f}",
+                end=" ",
+            )
+
+    return weights
+
+
+def _attribute_one_subject(
+    model: torch.nn.Module,
+    x_tensor: torch.Tensor,
+    weights: dict[str, np.ndarray],
+    weight_types: list[str],
+    device: str,
+    downsample_factor: int,
+    null_weight_sets: list[dict[str, np.ndarray]] | None = None,
+) -> tuple[
+    dict[str, tuple[np.ndarray, np.ndarray]],
+    dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+]:
+    """Run one shared forward pass, then backprop_from_w per weight type.
+
+    Returns ``(observed, null)``:
+      - ``observed[weight_type] = (signed_map, abs_map)`` — as before.
+      - ``null[weight_type] = (null_mean_signed, null_var_signed,
+        null_mean_abs, null_var_abs)`` — Welford mean/var across
+        ``null_weight_sets`` (one full backprop per permutation per weight
+        type). Empty dict if ``null_weight_sets`` is None/empty.
+
+    On CUDA OOM (forward or backward), retries the entire subject on CPU —
+    forward_cache moves `model` to the requested device itself, so no manual
+    device bookkeeping is needed across calls.
+    """
+    n_model_feat = getattr(model, "out_features", None)
+    cache = forward_cache(model, x_tensor, device=device, downsample_factor=downsample_factor)
+    n_perm = len(null_weight_sets) if null_weight_sets else 0
+    try:
+        observed: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for i, weight_type in enumerate(weight_types):
+            is_last_observed = i == len(weight_types) - 1
+            retain = not (is_last_observed and n_perm == 0)
+            observed[weight_type] = backprop_from_w(
+                cache, weights[weight_type], n_model_feat, retain_graph=retain
+            )
+
+        null: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+        if n_perm:
+            for wi, weight_type in enumerate(weight_types):
+                acc_signed = WelfordAccumulator(cache.original_size)
+                acc_abs = WelfordAccumulator(cache.original_size)
+                for pi in range(n_perm):
+                    is_last = (wi == len(weight_types) - 1) and (pi == n_perm - 1)
+                    signed_map, abs_map = backprop_from_w(
+                        cache, null_weight_sets[pi][weight_type], n_model_feat,
+                        retain_graph=not is_last,
+                    )
+                    acc_signed.update(signed_map)
+                    acc_abs.update(abs_map)
+                mean_s, var_s = acc_signed.finalize()
+                mean_a, var_a = acc_abs.finalize()
+                null[weight_type] = (mean_s, var_s, mean_a, var_a)
+
+        return observed, null
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower() and "cuda" in str(device):
+            torch.cuda.empty_cache()
+            return _attribute_one_subject(
+                model, x_tensor, weights, weight_types, "cpu", downsample_factor,
+                null_weight_sets,
+            )
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -345,13 +480,38 @@ def _load_roi_comparison(result_dir: Path, lut: dict[int, str]) -> pd.DataFrame 
 # Region importance DataFrame builder
 # ---------------------------------------------------------------------------
 
+def _accumulate_region_maps(
+    signed_map: np.ndarray,
+    abs_map: np.ndarray,
+    parc: np.ndarray,
+    signed_accum: dict[int, list[float]],
+    abs_accum: dict[int, list[float]],
+    nvox_accum: dict[int, int] | None = None,
+) -> None:
+    """Project (signed_map, abs_map) to atlas regions and accumulate per-region means."""
+    reg_signed, reg_abs = project_to_atlas(signed_map, abs_map, parc)
+    for lid, (val, n_vox) in reg_abs.items():
+        abs_accum.setdefault(lid, []).append(val)
+        if nvox_accum is not None:
+            nvox_accum[lid] = n_vox
+    for lid, (val, _) in reg_signed.items():
+        signed_accum.setdefault(lid, []).append(val)
+
+
 def _region_importance_df(
     region_signed_accum: dict[int, list[float]],
     region_abs_accum: dict[int, list[float]],
     region_nvox: dict[int, int],
     lut: dict[int, str],
     groups: tuple[str, str],
+    extra_accums: dict[str, dict[int, list[float]]] | None = None,
 ) -> pd.DataFrame:
+    """Build the per-region importance table.
+
+    `extra_accums` (Phase 4b null-correction): optional `{column_name:
+    {label_id: [values...]}}` — each is averaged per region and added as an
+    extra column (e.g. null mean/variance, corrected, and z-score maps).
+    """
     group_a, group_b = groups
     rows = []
     for label_id in sorted(region_abs_accum.keys()):
@@ -367,7 +527,7 @@ def _region_importance_df(
         else:
             hemisphere = "bilateral"
 
-        rows.append({
+        row = {
             "label_id": label_id,
             "region_name": region_name,
             "hemisphere": hemisphere,
@@ -375,7 +535,11 @@ def _region_importance_df(
             "mean_signed_importance": mean_signed,
             "direction": f"{group_a} > {group_b}" if mean_signed > 0 else f"{group_b} > {group_a}",
             "n_voxels": n_vox,
-        })
+        }
+        if extra_accums:
+            for col_name, accum in extra_accums.items():
+                row[col_name] = float(np.mean(accum.get(label_id, [0.0])))
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -478,7 +642,14 @@ def run(
     device: str,
     skip_lme: bool,
     downsample_factor: int = 2,
+    weight_types: list[str] | None = None,
+    rf_n_estimators: int = 200,
+    rf_permutation_repeats: int = 10,
+    rf_min_samples_leaf: int = 5,
+    n_permutations: int = 0,
+    null_rng_seed: int = 0,
 ) -> None:
+    weight_types = weight_types or ["tstat"]
     ds_cfg = _get_dataset_config(dataset, project_root)
     groups: tuple[str, str] = ds_cfg["groups"]
     result_dir = Path(ds_cfg["result_dir"])
@@ -610,139 +781,264 @@ def run(
         out_dir = result_dir / "group_diff" / "voxel_importance" / aggregation
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Compute per-seed importance weights ---
-        seed_weights: list[tuple[Path, np.ndarray]] = []
+        # --- Pass A: compute per-seed raw importance weights ---
+        seed_weights: list[tuple[int, np.ndarray, np.ndarray, dict[str, np.ndarray]]] = []
         for npz_path in npz_files:
             print(f"  Importance weights: {npz_path.name} ...", end=" ", flush=True)
-            w = _compute_importance_weights(npz_path, manifest, aggregation, groups)
-            if w is None:
+            agg_result = _build_aggregated_features(npz_path, manifest, aggregation, groups)
+            if agg_result is None:
                 print("skipped (insufficient data)")
                 continue
-            seed_weights.append((npz_path, w))
-            print(f"done  n_feat={len(w)}")
+            X_agg, bands_agg, seed = agg_result
+            weights = _compute_seed_weights(
+                X_agg, bands_agg, groups, weight_types, seed,
+                rf_n_estimators=rf_n_estimators,
+                rf_permutation_repeats=rf_permutation_repeats,
+                rf_min_samples_leaf=rf_min_samples_leaf,
+            )
+            seed_weights.append((seed, X_agg, bands_agg, weights))
+            n_feat = next(iter(weights.values())).shape[0]
+            print(f"done  n_feat={n_feat}")
 
         if not seed_weights:
             print(f"  No valid importance weights for '{aggregation}' — skipping.")
             continue
 
-        # --- Accumulate attribution maps across seeds and subjects ---
+        # Standardize: rank-normalize each raw weight vector to a common
+        # marginal so w_t, w_shap, w_hybrid are on equal footing before
+        # backprop (their raw scales differ by orders of magnitude).
+        for _, _, _, weights in seed_weights:
+            for weight_type in weight_types:
+                weights[weight_type] = rank_normalize(weights[weight_type])
+
+        # --- Pass A': permutation-null weight sets (Phase 4b) ---
+        # group_perm architecture-bias null, applied to ALL requested weight
+        # types: for each seed, n_permutations group-label permutations, each
+        # re-deriving {tstat, shap, hybrid} from scratch (refitting the RF for
+        # shap/hybrid) and rank-normalizing. Expensive — disabled by default
+        # (n_permutations=0).
+        null_weights: dict[int, list[dict[str, np.ndarray]]] = {}
+        if n_permutations > 0:
+            print(
+                f"\n  Computing {n_permutations} group-label-permutation null "
+                f"weight set(s) per seed for {weight_types} ..."
+            )
+            for seed, X_agg, bands_agg, _ in seed_weights:
+                rng = np.random.default_rng(null_rng_seed + seed)
+                t0 = time.time()
+                perms: list[dict[str, np.ndarray]] = []
+                for _ in range(n_permutations):
+                    perm_bands = rng.permutation(bands_agg)
+                    w_perm = _compute_seed_weights(
+                        X_agg, perm_bands, groups, weight_types, seed,
+                        rf_n_estimators=rf_n_estimators,
+                        rf_permutation_repeats=rf_permutation_repeats,
+                        rf_min_samples_leaf=rf_min_samples_leaf,
+                        verbose=False,
+                    )
+                    for weight_type in weight_types:
+                        w_perm[weight_type] = rank_normalize(w_perm[weight_type])
+                    perms.append(w_perm)
+                null_weights[seed] = perms
+                print(
+                    f"    seed={seed}: {n_permutations} null weight set(s) "
+                    f"in {time.time() - t0:.0f}s"
+                )
+
+        # --- Pass B: accumulate attribution maps across seeds and subjects ---
         # Preprocessing is already done (cached_tensors); only gradient computation here.
-        sum_signed_by_seed: list[np.ndarray] = []
-        sum_abs_by_seed: list[np.ndarray] = []
-        region_abs_accum:    dict[int, list[float]] = {}
-        region_signed_accum: dict[int, list[float]] = {}
-        region_nvox:         dict[int, int] = {}
+        # forward_cache runs once per subject; backprop_from_w runs once per weight type
+        # on the same cached forward pass (plus n_permutations null backprops per
+        # weight type if Phase 4b null-correction is enabled).
+        sum_signed_by_seed: dict[str, list[np.ndarray]] = {wt: [] for wt in weight_types}
+        sum_abs_by_seed:    dict[str, list[np.ndarray]] = {wt: [] for wt in weight_types}
+        region_abs_accum:    dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
+        region_signed_accum: dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
+        region_nvox:         dict[str, dict[int, int]] = {wt: {} for wt in weight_types}
+
+        # Phase 4b: group_perm null-correction accumulators (populated only if
+        # n_permutations > 0). For each subject: null mean/var maps (architecture
+        # bias), corrected = observed - null_mean, and z = (observed - null_mean) /
+        # sqrt(null_var) — each projected to atlas regions and averaged like the
+        # observed maps.
+        region_null_signed_accum:      dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
+        region_null_abs_accum:         dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
+        region_corrected_signed_accum: dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
+        region_corrected_abs_accum:    dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
+        region_z_signed_accum:         dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
+        region_z_abs_accum:            dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
+
         n_maps_total = 0
 
-        for npz_path, w in seed_weights:
-            _, _, meta = load_features(npz_path)
-            seed = meta["seed"]
+        for seed, _, _, weights in seed_weights:
+            null_suffix = f" x {n_permutations} null permutation(s)" if n_permutations > 0 else ""
             print(
-                f"  Seed {seed}: computing {len(cached_tensors)} attribution maps ...",
+                f"  Seed {seed}: computing {len(cached_tensors)} attribution map(s) "
+                f"x {len(weight_types)} weight type(s){null_suffix} ...",
                 flush=True,
             )
             t_seed = time.time()
 
             model = _build_cnn(arch, channels_list, seed, device)
+            seed_null_weights = null_weights.get(seed)
 
-            per_seed_signed: list[np.ndarray] = []
-            per_seed_abs:    list[np.ndarray] = []
+            per_seed_signed: dict[str, list[np.ndarray]] = {wt: [] for wt in weight_types}
+            per_seed_abs:    dict[str, list[np.ndarray]] = {wt: [] for wt in weight_types}
 
             for x_tensor, parc, _, brain_mask in cached_tensors:
                 try:
-                    signed_map, abs_map = compute_attribution_map(
-                        model, x_tensor, w, device=device,
-                        downsample_factor=downsample_factor,
+                    results, null_results = _attribute_one_subject(
+                        model, x_tensor, weights, weight_types, device, downsample_factor,
+                        null_weight_sets=seed_null_weights,
                     )
                 except RuntimeError as exc:
                     print(f"    Gradient computation failed: {exc}")
                     continue
 
-                signed_map[~brain_mask] = 0.0
-                abs_map[~brain_mask] = 0.0
+                for weight_type, (signed_map, abs_map) in results.items():
+                    signed_map[~brain_mask] = 0.0
+                    abs_map[~brain_mask] = 0.0
 
-                per_seed_signed.append(signed_map)
-                per_seed_abs.append(abs_map)
+                    per_seed_signed[weight_type].append(signed_map)
+                    per_seed_abs[weight_type].append(abs_map)
 
-                reg_signed, reg_abs = project_to_atlas(signed_map, abs_map, parc)
-                for lid, (val, n_vox) in reg_abs.items():
-                    region_abs_accum.setdefault(lid, []).append(val)
-                    region_nvox[lid] = n_vox
-                for lid, (val, _) in reg_signed.items():
-                    region_signed_accum.setdefault(lid, []).append(val)
+                    _accumulate_region_maps(
+                        signed_map, abs_map, parc,
+                        region_signed_accum[weight_type], region_abs_accum[weight_type],
+                        region_nvox[weight_type],
+                    )
+
+                    if weight_type in null_results:
+                        null_mean_s, null_var_s, null_mean_a, null_var_a = null_results[weight_type]
+                        null_mean_s = null_mean_s.copy()
+                        null_mean_a = null_mean_a.copy()
+                        null_mean_s[~brain_mask] = 0.0
+                        null_mean_a[~brain_mask] = 0.0
+
+                        corrected_signed = signed_map - null_mean_s
+                        corrected_abs = abs_map - null_mean_a
+                        z_signed = null_correction(signed_map, null_mean_s, null_var_s)
+                        z_abs = null_correction(abs_map, null_mean_a, null_var_a)
+                        for arr in (corrected_signed, corrected_abs, z_signed, z_abs):
+                            arr[~brain_mask] = 0.0
+
+                        _accumulate_region_maps(
+                            null_mean_s, null_mean_a, parc,
+                            region_null_signed_accum[weight_type], region_null_abs_accum[weight_type],
+                        )
+                        _accumulate_region_maps(
+                            corrected_signed, corrected_abs, parc,
+                            region_corrected_signed_accum[weight_type], region_corrected_abs_accum[weight_type],
+                        )
+                        _accumulate_region_maps(
+                            z_signed, z_abs, parc,
+                            region_z_signed_accum[weight_type], region_z_abs_accum[weight_type],
+                        )
 
                 n_maps_total += 1
 
             del model  # free GPU/CPU memory before next seed
 
-            if per_seed_signed:
-                sum_signed_by_seed.append(np.mean(per_seed_signed, axis=0))
-                sum_abs_by_seed.append(np.mean(per_seed_abs, axis=0))
-                print(
-                    f"    {len(per_seed_signed)} maps in {time.time() - t_seed:.0f}s "
-                    f"({(time.time() - t_seed) / max(1, len(per_seed_signed)):.1f}s/subject)"
-                )
+            for weight_type in weight_types:
+                if per_seed_signed[weight_type]:
+                    sum_signed_by_seed[weight_type].append(np.mean(per_seed_signed[weight_type], axis=0))
+                    sum_abs_by_seed[weight_type].append(np.mean(per_seed_abs[weight_type], axis=0))
+
+            print(
+                f"    {len(cached_tensors)} subject(s) in {time.time() - t_seed:.0f}s "
+                f"({(time.time() - t_seed) / max(1, len(cached_tensors)):.1f}s/subject)"
+            )
 
         if n_maps_total == 0:
             print(f"  No attribution maps produced for '{aggregation}' — skipping.")
             continue
 
-        n_valid_seeds = len(sum_signed_by_seed)
-        mean_signed_global = np.mean(sum_signed_by_seed, axis=0).astype(np.float32)
-        mean_abs_global    = np.mean(sum_abs_by_seed,    axis=0).astype(np.float32)
-        print(
-            f"  Aggregated {n_maps_total} maps from {n_valid_seeds} seed(s); "
-            f"global max |attribution| = {mean_abs_global.max():.4g}"
-        )
+        # --- Per-weight-type outputs ---
+        for weight_type in weight_types:
+            if not sum_signed_by_seed[weight_type]:
+                print(f"  [{weight_type}] No attribution maps produced — skipping.")
+                continue
 
-        extractor_key = f"{arch}__{scaler}__{channels}__nsub{n_subjects}__{n_valid_seeds}seeds"
-
-        # --- Save voxel maps as NIfTI ---
-        if save_voxel_map and first_affine is not None:
-            for tag, data in [("signed", mean_signed_global), ("abs", mean_abs_global)]:
-                nii_path = out_dir / f"voxel_map_{tag}_{extractor_key}.nii.gz"
-                nib.save(nib.Nifti1Image(data, affine=first_affine), str(nii_path))
-                print(f"  Saved {nii_path.name}")
-        elif save_voxel_map:
-            print("  Warning: could not save NIfTI (no subject affine captured)")
-
-        # --- Region importance DataFrame ---
-        region_df = _region_importance_df(
-            region_signed_accum, region_abs_accum, region_nvox, lut, groups
-        )
-        csv_path = out_dir / f"region_importance_{extractor_key}.csv"
-        region_df.to_csv(csv_path, index=False)
-        print(f"  Saved {csv_path.name} ({len(region_df)} regions)")
-
-        # --- Bar plot ---
-        _make_barplot(
-            region_df,
-            title=(
-                f"CNN voxel importance — {aggregation}\n"
-                f"({arch}/{scaler}/{channels}, {n_valid_seeds} seeds, "
-                f"{group_a} vs {group_b})"
-            ),
-            out_path=out_dir / f"region_barplot_{extractor_key}.png",
-            groups=groups,
-        )
-
-        # --- FS ROI comparison ---
-        if roi_comparison is not None:
-            merged = pd.merge(
-                region_df[["label_id", "region_name", "mean_abs_importance", "mean_signed_importance"]],
-                roi_comparison[["label_id", "region_name", "max_abs_cohen_d_roi"]],
-                on=["label_id", "region_name"],
-                how="inner",
+            n_valid_seeds = len(sum_signed_by_seed[weight_type])
+            mean_signed_global = np.mean(sum_signed_by_seed[weight_type], axis=0).astype(np.float32)
+            mean_abs_global    = np.mean(sum_abs_by_seed[weight_type],    axis=0).astype(np.float32)
+            print(
+                f"  [{weight_type}] Aggregated maps from {n_valid_seeds} seed(s); "
+                f"global max |attribution| = {mean_abs_global.max():.4g}"
             )
-            if not merged.empty:
-                cmp_path = out_dir / f"cnn_vs_roi_comparison_{extractor_key}.csv"
-                merged.to_csv(cmp_path, index=False)
-                print(f"  Saved {cmp_path.name} ({len(merged)} matched regions)")
-                _make_scatter(
-                    merged,
-                    title=f"CNN vs FS ROI — {aggregation}",
-                    out_path=out_dir / f"cnn_vs_roi_scatter_{extractor_key}.png",
+
+            extractor_key = (
+                f"{arch}__{scaler}__{channels}__{weight_type}__nsub{n_subjects}__{n_valid_seeds}seeds"
+            )
+
+            # --- Save voxel maps as NIfTI ---
+            if save_voxel_map and first_affine is not None:
+                for tag, data in [("signed", mean_signed_global), ("abs", mean_abs_global)]:
+                    nii_path = out_dir / f"voxel_map_{tag}_{extractor_key}.nii.gz"
+                    nib.save(nib.Nifti1Image(data, affine=first_affine), str(nii_path))
+                    print(f"  Saved {nii_path.name}")
+            elif save_voxel_map:
+                print("  Warning: could not save NIfTI (no subject affine captured)")
+
+            # --- Phase 4b: null-correction extra columns + FWER threshold ---
+            extra_accums = None
+            if n_permutations > 0 and region_null_signed_accum[weight_type]:
+                extra_accums = {
+                    "mean_null_signed_importance": region_null_signed_accum[weight_type],
+                    "mean_null_abs_importance": region_null_abs_accum[weight_type],
+                    "mean_corrected_signed_importance": region_corrected_signed_accum[weight_type],
+                    "mean_corrected_abs_importance": region_corrected_abs_accum[weight_type],
+                    "mean_z_signed": region_z_signed_accum[weight_type],
+                    "mean_z_abs": region_z_abs_accum[weight_type],
+                }
+                z_threshold = derive_threshold(
+                    np.empty(mean_abs_global.shape, dtype=np.float32), alpha=0.05
                 )
+                print(
+                    f"  [{weight_type}] Null-corrected ({n_permutations} group_perm "
+                    f"permutation(s)); voxelwise |z| FWER threshold (alpha=0.05, "
+                    f"Bonferroni over {mean_abs_global.size} voxels) = {z_threshold:.2f}"
+                )
+
+            # --- Region importance DataFrame ---
+            region_df = _region_importance_df(
+                region_signed_accum[weight_type], region_abs_accum[weight_type],
+                region_nvox[weight_type], lut, groups,
+                extra_accums=extra_accums,
+            )
+            csv_path = out_dir / f"region_importance_{extractor_key}.csv"
+            region_df.to_csv(csv_path, index=False)
+            print(f"  Saved {csv_path.name} ({len(region_df)} regions)")
+
+            # --- Bar plot ---
+            _make_barplot(
+                region_df,
+                title=(
+                    f"CNN voxel importance — {aggregation} ({weight_type})\n"
+                    f"({arch}/{scaler}/{channels}, {n_valid_seeds} seeds, "
+                    f"{group_a} vs {group_b})"
+                ),
+                out_path=out_dir / f"region_barplot_{extractor_key}.png",
+                groups=groups,
+            )
+
+            # --- FS ROI comparison ---
+            if roi_comparison is not None:
+                merged = pd.merge(
+                    region_df[["label_id", "region_name", "mean_abs_importance", "mean_signed_importance"]],
+                    roi_comparison[["label_id", "region_name", "max_abs_cohen_d_roi"]],
+                    on=["label_id", "region_name"],
+                    how="inner",
+                )
+                if not merged.empty:
+                    cmp_path = out_dir / f"cnn_vs_roi_comparison_{extractor_key}.csv"
+                    merged.to_csv(cmp_path, index=False)
+                    print(f"  Saved {cmp_path.name} ({len(merged)} matched regions)")
+                    _make_scatter(
+                        merged,
+                        title=f"CNN vs FS ROI — {aggregation} ({weight_type})",
+                        out_path=out_dir / f"cnn_vs_roi_scatter_{extractor_key}.png",
+                    )
 
     print(f"\nDone. Results written to {result_dir}/group_diff/voxel_importance/")
 
@@ -757,6 +1053,8 @@ def main() -> None:
             "Map CNN feature importance to voxel regions via gradient attribution.\n\n"
             "Outputs (in <result_dir>/group_diff/voxel_importance/<agg>/):\n"
             "  region_importance_*.csv         per-region signed + absolute importance\n"
+            "                                   (+ mean_null_*/mean_corrected_*/mean_z_*\n"
+            "                                   columns if --n-permutations > 0)\n"
             "  region_barplot_*.png            top-30 regions, colored by direction\n"
             "  cnn_vs_roi_comparison_*.csv     CNN importance vs FS ROI Cohen's d\n"
             "  cnn_vs_roi_scatter_*.png        scatter of the above\n"
@@ -813,6 +1111,47 @@ def main() -> None:
              "gradient checkpointing. Gradient is upsampled back to 256³. "
              "Use 1 to disable.",
     )
+    parser.add_argument(
+        "--weight-types", nargs="+", default=["tstat"],
+        choices=["tstat", "shap", "hybrid"],
+        help="Importance-weight derivation(s) to attribute and compare. "
+             "'tstat': Welch t-statistic (existing behavior). "
+             "'shap': signed mean TreeSHAP value from a RandomForestClassifier. "
+             "'hybrid': RF permutation-importance x sign(mean_a - mean_b). "
+             "'shap'/'hybrid' share one RF fit per (seed, aggregation). Default: tstat.",
+    )
+    parser.add_argument(
+        "--rf-n-estimators", type=int, default=200,
+        help="Number of trees for the RandomForestClassifier backing 'shap'/'hybrid' "
+             "weight types. Default: 200.",
+    )
+    parser.add_argument(
+        "--rf-permutation-repeats", type=int, default=10,
+        help="Number of shuffles per feature for sklearn permutation_importance, "
+             "used by the 'hybrid' weight type. Default: 10.",
+    )
+    parser.add_argument(
+        "--rf-min-samples-leaf", type=int, default=5,
+        help="min_samples_leaf for the RandomForestClassifier backing 'shap'/'hybrid'. "
+             "Prevents train_acc=1.0 (which makes 'hybrid' permutation importance "
+             "degenerate). Default: 5.",
+    )
+    parser.add_argument(
+        "--n-permutations", type=int, default=0,
+        help="Number of group-label permutations for the architecture-bias "
+             "permutation null (Phase 4b, group_perm design). 0 disables "
+             "null-correction (default). Each permutation re-derives ALL "
+             "requested --weight-types from permuted group labels "
+             "(refitting the RandomForestClassifier for 'shap'/'hybrid'), "
+             "rank-normalizes, and backpropagates -- expensive: budget "
+             "sbatch time/array-sizing accordingly (roughly "
+             "n_permutations x n_seeds x [RF-refit + backprop] extra work).",
+    )
+    parser.add_argument(
+        "--null-rng-seed", type=int, default=0,
+        help="Base RNG seed for group-label permutations (offset by CNN seed "
+             "per seed for reproducibility). Default: 0.",
+    )
     args = parser.parse_args()
 
     run(
@@ -828,6 +1167,12 @@ def main() -> None:
         device=args.device,
         skip_lme=args.skip_lme,
         downsample_factor=args.downsample,
+        weight_types=args.weight_types,
+        rf_n_estimators=args.rf_n_estimators,
+        rf_permutation_repeats=args.rf_permutation_repeats,
+        rf_min_samples_leaf=args.rf_min_samples_leaf,
+        n_permutations=args.n_permutations,
+        null_rng_seed=args.null_rng_seed,
     )
 
 

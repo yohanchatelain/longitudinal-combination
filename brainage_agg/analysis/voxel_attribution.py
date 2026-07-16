@@ -31,6 +31,14 @@ Low-level API (for custom pipelines)
     compute_attribution_map(model, x_tensor, importance_weights, device, downsample_factor)
     project_to_atlas(signed_map, abs_map, atlas)
     load_freesurfer_lut(lut_path)
+
+Activation-cached API (for multiple weight vectors per input)
+---------------------------------------------------------------
+    cache = forward_cache(model, x_tensor, device, downsample_factor)
+    signed_map, abs_map = backprop_from_w(cache, w, model.out_features, retain_graph=True)
+    # ... repeat backprop_from_w for additional weight vectors on the same cache,
+    # last call with retain_graph=False ...
+    compute_attribution_map(...) == forward_cache(...) + backprop_from_w(..., retain_graph=False)
 """
 from __future__ import annotations
 
@@ -74,6 +82,175 @@ def subject_parcellation_path(fs_root: str | Path, directory: str) -> Path:
     return Path(fs_root) / str(directory) / "mri" / "aparc+aseg.mgz"
 
 
+@dataclass
+class AttributionCache:
+    """Cached forward pass, ready for one or more `backprop_from_w` calls.
+
+    Attributes:
+        x_small:           Downsampled input, (1, C, h, w, d), requires_grad=True.
+        features:          Model output, (1, out_features), graph retained.
+        original_size:     (H, W, D) of the un-downsampled input — gradients are
+                            upsampled back to this shape.
+        device:            Device the cache lives on.
+        downsample_factor: Downsampling factor used to build x_small.
+    """
+
+    x_small: torch.Tensor
+    features: torch.Tensor
+    original_size: tuple[int, int, int]
+    device: torch.device
+    downsample_factor: int
+
+
+def forward_cache(
+    model: torch.nn.Module,
+    x_tensor: torch.Tensor,
+    device: str | torch.device = "cpu",
+    downsample_factor: int = 2,
+) -> AttributionCache:
+    """Run the forward pass once, retaining the graph for repeated backprop.
+
+    Downsamples the input (default factor 2: 256³→128³, see
+    `compute_attribution_map` for the memory rationale), runs the frozen CNN,
+    and returns an `AttributionCache` for `backprop_from_w`. On CUDA OOM,
+    retries the entire forward pass on CPU.
+
+    Args:
+        model:              Frozen 3-D CNN (all params have requires_grad=False).
+        x_tensor:           Input tensor (1, C, H, W, D), float32.
+        device:             Compute device ('cpu' or 'cuda').
+        downsample_factor:  Spatial downsampling applied before the forward pass.
+                            Default 2 (256³→128³). Use 1 to skip.
+    """
+    import torch.nn.functional as F
+
+    str_device = str(device)
+    model = model.to(device).eval()
+
+    x_full = x_tensor.to(device).detach()
+    original_size = x_full.shape[2:]  # (H, W, D)
+    if downsample_factor > 1:
+        x_small = F.interpolate(
+            x_full, scale_factor=1.0 / downsample_factor,
+            mode="trilinear", align_corners=False,
+        )
+    else:
+        x_small = x_full
+    x_small = x_small.requires_grad_(True)
+
+    try:
+        features = model(x_small)
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower() and "cuda" in str_device:
+            torch.cuda.empty_cache()
+            return forward_cache(model, x_tensor, "cpu", downsample_factor)
+        raise
+
+    return AttributionCache(
+        x_small=x_small,
+        features=features,
+        original_size=tuple(int(s) for s in original_size),
+        device=torch.device(device),
+        downsample_factor=downsample_factor,
+    )
+
+
+def _raw_grad_small(
+    cache: AttributionCache,
+    importance_weights: np.ndarray,
+    model_out_features: int | None = None,
+    retain_graph: bool = True,
+) -> torch.Tensor:
+    """Backpropagate one weight vector; return the raw gradient at the
+    cached *downsampled* resolution, before channel reduction or upsampling.
+
+    Shared by `backprop_from_w` (full signed/abs maps, channel-reduced and
+    upsampled) and `permutation_null.cache_topk_gradients` (per-feature
+    gradients for the feature-index-permutation null), which only need this
+    raw `(C, h, w, d)` tensor.
+
+    Args:
+        cache:               Result of `forward_cache`.
+        importance_weights:  (n_features,) signed weights. For concatenation
+                             aggregations whose weight vector is k×n_features,
+                             segments are averaged to n_features.
+        model_out_features:  Model's `out_features` (e.g. `model.out_features`),
+                             used for the k×n_feat → n_feat reconciliation above.
+                             Pass `None` to skip (weight length must already match).
+        retain_graph:        Pass `True` for all but the last backward pass on
+                             a given `cache` (PyTorch frees the graph after a
+                             `retain_graph=False` backward pass).
+
+    Returns:
+        (C, h, w, d) tensor — d(scalar)/d(cache.x_small), on `cache.device`.
+    """
+    raw_w = np.asarray(importance_weights, dtype=np.float32)
+    if model_out_features is not None and raw_w.shape[0] != model_out_features:
+        if raw_w.shape[0] % model_out_features == 0:
+            n_seg = raw_w.shape[0] // model_out_features
+            raw_w = raw_w.reshape(n_seg, model_out_features).mean(axis=0)
+        else:
+            raise ValueError(
+                f"importance_weights length ({raw_w.shape[0]}) is not a multiple "
+                f"of model output dim ({model_out_features}). Check arch/channels."
+            )
+    w = torch.tensor(raw_w, dtype=torch.float32, device=cache.device)
+
+    if cache.x_small.grad is not None:
+        cache.x_small.grad = None
+
+    scalar = (cache.features[0] * w).sum()
+    scalar.backward(retain_graph=retain_graph)
+
+    return cache.x_small.grad[0].detach()  # (C, h, w, d)
+
+
+def backprop_from_w(
+    cache: AttributionCache,
+    importance_weights: np.ndarray,
+    model_out_features: int | None = None,
+    retain_graph: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Backpropagate one importance-weight vector through a cached forward pass.
+
+    Computes:
+        scalar = sum_i( w_i * cache.features_i )
+        grad   = d(scalar) / d(cache.x_small)   (at downsampled resolution)
+        → trilinearly upsampled back to cache.original_size
+
+    Args:
+        cache:               Result of `forward_cache`.
+        importance_weights:  (n_features,) signed weights. For concatenation
+                             aggregations whose weight vector is k×n_features,
+                             segments are averaged to n_features.
+        model_out_features:  Model's `out_features` (e.g. `model.out_features`),
+                             used for the k×n_feat → n_feat reconciliation above.
+                             Pass `None` to skip (weight length must already match).
+        retain_graph:        Pass `True` for all but the last `backprop_from_w`
+                             call on a given `cache` (PyTorch frees the graph
+                             after a `retain_graph=False` backward pass).
+
+    Returns:
+        signed_map: (H, W, D) float32 — mean gradient over C channels, retains sign.
+        abs_map:    (H, W, D) float32 — channel-wise |gradient| averaged over channels.
+    """
+    import torch.nn.functional as F
+
+    grad_small = _raw_grad_small(cache, importance_weights, model_out_features, retain_graph)
+    if cache.downsample_factor > 1:
+        grad_full = F.interpolate(
+            grad_small.unsqueeze(0), size=cache.original_size,
+            mode="trilinear", align_corners=False,
+        )[0]
+    else:
+        grad_full = grad_small
+
+    grad_np = grad_full.cpu().numpy()                        # (C, H, W, D)
+    signed_map = grad_np.mean(axis=0).astype(np.float32)    # (H, W, D)
+    abs_map = np.abs(grad_np).mean(axis=0).astype(np.float32)
+    return signed_map, abs_map
+
+
 def compute_attribution_map(
     model: torch.nn.Module,
     x_tensor: torch.Tensor,
@@ -83,15 +260,16 @@ def compute_attribution_map(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Backpropagate importance-weighted CNN features to input voxels.
 
-    Computes:
-        scalar = sum_i( w_i * CNN_feature_i(x_small) )
-        grad   = d(scalar) / d(x_small)   (at downsampled resolution)
-        → trilinearly upsampled back to the original volume shape
+    Backward-compatible single-weight wrapper: `forward_cache` followed by a
+    single `backprop_from_w(..., retain_graph=False)` call. For multiple
+    weight vectors per input (e.g. w_t/w_shap/w_hybrid), call `forward_cache`
+    once and `backprop_from_w` per vector instead — this avoids redundant
+    forward passes.
 
     Downsampling the input (default factor 2: 256³→128³) reduces peak GPU
-    memory by 8× (first-layer activations: 4.3 GB→0.54 GB), making the
+    memory by 8x (first-layer activations: 4.3 GB→0.54 GB), making the
     forward+backward fit comfortably on a 14 GB GPU without autocast or
-    gradient checkpointing.  The upsampled gradient retains sufficient spatial
+    gradient checkpointing. The upsampled gradient retains sufficient spatial
     resolution for region-level atlas projection.
 
     Args:
@@ -109,42 +287,11 @@ def compute_attribution_map(
         signed_map: (H, W, D) float32 — mean gradient over C channels, retains sign.
         abs_map:    (H, W, D) float32 — channel-wise |gradient| averaged over channels.
     """
-    import torch.nn.functional as F
-
     str_device = str(device)
-    model = model.to(device).eval()
-
-    # --- Reconcile concatenation aggregation weights (k×n_feat → n_feat) -----
+    cache = forward_cache(model, x_tensor, device=device, downsample_factor=downsample_factor)
     n_model_feat = getattr(model, "out_features", None)
-    raw_w = np.asarray(importance_weights, dtype=np.float32)
-    if n_model_feat is not None and raw_w.shape[0] != n_model_feat:
-        if raw_w.shape[0] % n_model_feat == 0:
-            n_seg = raw_w.shape[0] // n_model_feat
-            raw_w = raw_w.reshape(n_seg, n_model_feat).mean(axis=0)
-        else:
-            raise ValueError(
-                f"importance_weights length ({raw_w.shape[0]}) is not a multiple "
-                f"of model output dim ({n_model_feat}). Check arch/channels."
-            )
-    w = torch.tensor(raw_w, dtype=torch.float32, device=device)
-
-    # --- Downsample input -------------------------------------------------------
-    x_full = x_tensor.to(device).detach()
-    original_size = x_full.shape[2:]  # (H, W, D)
-    if downsample_factor > 1:
-        x_small = F.interpolate(
-            x_full, scale_factor=1.0 / downsample_factor,
-            mode="trilinear", align_corners=False,
-        )
-    else:
-        x_small = x_full
-    x_small = x_small.requires_grad_(True)
-
-    # --- Forward + backward ----------------------------------------------------
     try:
-        features = model(x_small)
-        scalar = (features[0] * w).sum()
-        scalar.backward()
+        return backprop_from_w(cache, importance_weights, n_model_feat, retain_graph=False)
     except RuntimeError as exc:
         if "out of memory" in str(exc).lower() and "cuda" in str_device:
             torch.cuda.empty_cache()
@@ -152,21 +299,6 @@ def compute_attribution_map(
                 model, x_tensor, importance_weights, "cpu", downsample_factor
             )
         raise
-
-    # --- Upsample gradient to original resolution ------------------------------
-    grad_small = x_small.grad[0].detach()  # (C, H/f, W/f, D/f)
-    if downsample_factor > 1:
-        grad_full = F.interpolate(
-            grad_small.unsqueeze(0), size=original_size,
-            mode="trilinear", align_corners=False,
-        )[0]
-    else:
-        grad_full = grad_small
-
-    grad_np = grad_full.cpu().numpy()                        # (C, H, W, D)
-    signed_map = grad_np.mean(axis=0).astype(np.float32)    # (H, W, D)
-    abs_map = np.abs(grad_np).mean(axis=0).astype(np.float32)
-    return signed_map, abs_map
 
 
 def project_to_atlas(
