@@ -115,17 +115,30 @@ Three things to resolve before these numbers go in a paper draft:
    The two NKI cells above are constant (Pearson/Spearman undefined) because
    *every* seed's permutation importance collapsed to all-zero — confirmed
    from the sweep logs (`phase4b_284815_{3,5}.out`: `imp_nonzero_frac=0.000`,
-   `train_acc=1.000`, 10/10 seeds). But pulling `imp_nonzero_frac` across all
+   `train_acc=1.000`, 10/10 seeds). Pulling `imp_nonzero_frac` across all
    12 array-task logs shows this isn't isolated: **83 of 120 hybrid RF fits
    sweep-wide (69%) hit `imp_nonzero_frac=0.000`**, ranging from 2/10 seeds
-   (task 2) to 10/10 (tasks 3, 5). `min_samples_leaf=5` — added specifically
-   to prevent this (see `importance_weights.fit_rf` docstring) — is not
-   sufficient at `d_agg` up to 23,040 with n≈50-250 subjects. This means
-   `w_hybrid` results should be treated as unreliable **throughout** the
-   sweep, not only in the two constant-map cells, and the hybrid row of the
-   table above should not be reported without either (a) a stronger RF
-   regularization pass and re-run, or (b) dropping `w_hybrid` from the
-   comparison entirely.
+   (task 2) to 10/10 (tasks 3, 5).
+
+   **Root cause identified and fixed** (2026-07-16,
+   `importance_weights.compute_w_hybrid`): the problem was never RF
+   regularization (`min_samples_leaf=5` was already in place and didn't
+   help) — it was the `scoring="accuracy"` argument to
+   `sklearn.inspection.permutation_importance`. With train_acc=1.0 and
+   high-confidence `predict_proba` margins (typical at d up to 23,040,
+   n≈50-250), a single permuted feature essentially never flips a 0/1
+   accuracy outcome, so importances round to exactly zero regardless of
+   whether the feature is informative. A matched synthetic benchmark (same
+   RF hyperparameters, real injected signal) confirmed `scoring="roc_auc"`
+   has the identical failure mode, while `scoring="neg_log_loss"` (continuous
+   in `predict_proba`, sensitive to sub-threshold shifts) raised
+   `imp_nonzero_frac` from 0.000 to 0.36-0.95 with *no other change*.
+   `compute_w_hybrid` now uses `scoring="neg_log_loss"`.
+
+   **This does not retroactively fix the table above** — the sweep needs to be
+   re-run for `w_hybrid` numbers to be trustworthy. The `tstat` and `shap`
+   rows are unaffected (they don't use `permutation_importance`) and don't
+   need a re-run.
 3. **`lme_slope` and `lme_slope_change` rows are numerically identical**
    (both datasets, all three weight types) — this is expected, not a bug:
    `aggregations.lme_slope_change` is defined (`brainage_agg/agg/aggregations.py:112-123`)
