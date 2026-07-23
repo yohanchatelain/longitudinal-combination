@@ -50,6 +50,9 @@ Child-vs-Adult, PPMI PD-vs-HC; 10 CNN seeds; group_perm null correction,
 (max |Cohen's d| per region) across all 6 aggregations × 3 weight-derivation
 methods × 2 datasets:
 
+*(updated 2026-07-23 after the corrected re-run, job 319349 — see below; all
+rows are current except NKI/lme_slope/hybrid, still stale, see caveat 3)*
+
 | Dataset | Aggregation | Weight | n | Pearson r | Spearman rho | Top region (mean abs attr) |
 |---|---|---|---|---|---|---|
 | NKI | mean | tstat | 105 | 0.175 | 0.141 | ctx-rh-rostralmiddlefrontal |
@@ -57,50 +60,51 @@ methods × 2 datasets:
 | NKI | mean | hybrid | 105 | 0.072 | 0.044 | ctx-rh-parsopercularis |
 | NKI | concatenation | tstat | 106 | 0.062 | 0.086 | Right-Cerebellum-Cortex |
 | NKI | concatenation | shap | 106 | 0.041 | -0.098 | ctx-lh-supramarginal |
-| NKI | concatenation | hybrid | 106 | 0.145 | 0.106 | ctx-lh-inferiorparietal |
+| NKI | concatenation | hybrid | 106 | 0.196 | 0.235 | Right-Cerebellum-White-Matter |
 | NKI | annualized_rate | tstat | 106 | -0.103 | -0.073 | Right-Cerebellum-Cortex |
 | NKI | annualized_rate | shap | 106 | -0.111 | -0.061 | Right-Cerebellum-Cortex |
-| NKI | annualized_rate | hybrid | 106 | -0.109 | -0.027 | Right-Cerebellum-Cortex |
+| NKI | annualized_rate | hybrid | 106 | 0.024 | 0.215 | Right-Cerebellum-Cortex |
 | NKI | lme_slope | tstat | 106 | 0.022 | -0.038 | Right-Cerebellum-White-Matter |
 | NKI | lme_slope | shap | 106 | 0.099 | 0.106 | Right-Cerebellum-Cortex |
-| NKI | lme_slope | hybrid | 106 | n/a (constant) | n/a (constant) | Left-Lateral-Ventricle |
+| NKI | lme_slope | hybrid | 106 | **STALE — re-run in flight (job 322562)** | | Left-Lateral-Ventricle |
 | NKI | difference | tstat | 106 | -0.107 | -0.050 | Right-Cerebellum-Cortex |
 | NKI | difference | shap | 106 | 0.177 | 0.216 | ctx-lh-frontalpole |
-| NKI | difference | hybrid | 106 | -0.072 | -0.050 | Right-Cerebellum-Cortex |
+| NKI | difference | hybrid | 106 | -0.062 | 0.052 | Right-Cerebellum-Cortex |
 | NKI | lme_slope_change | tstat | 106 | 0.030 | -0.041 | Right-Cerebellum-White-Matter |
 | NKI | lme_slope_change | shap | 106 | 0.070 | 0.016 | ctx-lh-frontalpole |
-| NKI | lme_slope_change | hybrid | 106 | n/a (constant) | n/a (constant) | Left-Lateral-Ventricle |
+| NKI | lme_slope_change | hybrid | 106 | -0.120 | -0.129 | Left-choroid-plexus |
 | PPMI | mean | tstat | 109 | -0.124 | -0.212 | ctx-lh-supramarginal |
 | PPMI | mean | shap | 109 | -0.598 | -0.645 | CC_Central |
-| PPMI | mean | hybrid | 109 | 0.020 | 0.070 | ctx-rh-inferiortemporal |
+| PPMI | mean | hybrid | 109 | 0.227 | 0.267 | ctx-lh-inferiorparietal |
 | PPMI | concatenation | tstat | 109 | -0.095 | -0.141 | ctx-lh-supramarginal |
 | PPMI | concatenation | shap | 109 | -0.589 | -0.614 | CC_Anterior |
-| PPMI | concatenation | hybrid | 109 | -0.189 | -0.222 | ctx-rh-entorhinal |
+| PPMI | concatenation | hybrid | 109 | 0.222 | 0.287 | ctx-lh-inferiorparietal |
 | PPMI | annualized_rate | tstat | 109 | 0.043 | 0.118 | Right-Cerebellum-Cortex |
 | PPMI | annualized_rate | shap | 109 | -0.449 | -0.441 | CC_Mid_Posterior |
-| PPMI | annualized_rate | hybrid | 109 | 0.003 | 0.041 | Left-Cerebellum-Cortex |
+| PPMI | annualized_rate | hybrid | 109 | 0.118 | 0.286 | Left-Cerebellum-White-Matter |
 | PPMI | lme_slope | tstat | 109 | 0.354 | 0.367 | ctx-lh-frontalpole |
 | PPMI | lme_slope | shap | 109 | -0.464 | -0.476 | CC_Posterior |
-| PPMI | lme_slope | hybrid | 109 | 0.167 | 0.210 | Right-Cerebellum-White-Matter |
+| PPMI | lme_slope | hybrid | 109 | 0.098 | 0.191 | Right-Cerebellum-Cortex |
 | PPMI | difference | tstat | 109 | -0.027 | 0.054 | Left-Cerebellum-Cortex |
 | PPMI | difference | shap | 109 | -0.453 | -0.455 | CC_Mid_Posterior |
-| PPMI | difference | hybrid | 109 | 0.065 | 0.070 | Left-Cerebellum-Cortex |
+| PPMI | difference | hybrid | 109 | 0.100 | 0.225 | Left-Cerebellum-Cortex |
 | PPMI | lme_slope_change | tstat | 109 | 0.354 | 0.367 | ctx-lh-frontalpole |
 | PPMI | lme_slope_change | shap | 109 | -0.464 | -0.476 | CC_Posterior |
-| PPMI | lme_slope_change | hybrid | 109 | 0.167 | 0.210 | Right-Cerebellum-White-Matter |
+| PPMI | lme_slope_change | hybrid | 109 | 0.098 | 0.191 | Right-Cerebellum-Cortex |
 
 **Headline finding: agreement between the CNN attribution maps and classical
 ROI effect sizes is weak overall**, and inconsistent in sign. Mean Pearson r
-across the 34 non-degenerate cells is +0.05 (tstat), +0.03 (hybrid), and
-**-0.21 (shap)** — i.e. the SHAP-derived weights are, on average, *anti*-correlated
-with where the classical ROI analysis finds effects, most strongly so on
-PPMI (r down to -0.60 for `mean`/shap). This does not by itself show the CNN
-attribution is wrong — a frozen, untrained CNN has no reason to rediscover
-the same effect-size ranking as a linear ROI model — but it means the
-"CNN vs ROI agreement" comparison **cannot currently be reported as a
-positive validation of the attribution method** without further caveats.
+across the 35 defined cells (all but the still-stale NKI/lme_slope/hybrid
+row) is +0.05 (tstat), +0.09 (hybrid), and **-0.21 (shap)** — i.e. the
+SHAP-derived weights are, on average, *anti*-correlated with where the
+classical ROI analysis finds effects, most strongly so on PPMI (r down to
+-0.60 for `mean`/shap). This does not by itself show the CNN attribution is
+wrong — a frozen, untrained CNN has no reason to rediscover the same
+effect-size ranking as a linear ROI model — but it means the "CNN vs ROI
+agreement" comparison **cannot currently be reported as a positive
+validation of the attribution method** without further caveats.
 
-Three things to resolve before these numbers go in a paper draft:
+Four things to resolve before these numbers go in a paper draft:
 
 1. **Cerebellum / corpus-callosum dominance.** 22 of the 36 (61%) top-attributed
    regions above are cerebellar or corpus-callosum labels — both are boundary
@@ -135,11 +139,28 @@ Three things to resolve before these numbers go in a paper draft:
    `imp_nonzero_frac` from 0.000 to 0.36-0.95 with *no other change*.
    `compute_w_hybrid` now uses `scoring="neg_log_loss"`.
 
-   **This does not retroactively fix the table above** — the sweep needs to be
-   re-run for `w_hybrid` numbers to be trustworthy. The `tstat` and `shap`
-   rows are unaffected (they don't use `permutation_importance`) and don't
-   need a re-run.
-3. **`lme_slope` and `lme_slope_change` rows are numerically identical**
+   **Confirmed fixed by the 2026-07-16 re-run (job 319349):** `imp_nonzero_frac`
+   is nonzero in all 120/120 seed-level RF fits sweep-wide (was 83/120 fully
+   degenerate before). The corrected `hybrid` numbers are now in the table
+   above, except NKI/lme_slope (see caveat 3).
+3. **A separate GPU-oversubscription bug silently discarded one cell's data.**
+   Task 3 of job 319349 (NKI `lme_slope`) still shows a constant/all-zero
+   `hybrid` map in the table above despite the fix, because this cluster's
+   only GPU node (`cgpu01`) has no SLURM GRES/GPU accounting configured
+   (`scontrol show node cgpu01` → `Gres=(null)`), so the scheduler doesn't
+   stop multiple array tasks landing on the same physical GPU. Four tasks
+   landed on it at once, each needing ~4.3GB against a 14.58GB card; task 3's
+   run hit CUDA OOM on every subject's gradient computation, logged
+   "No attribution maps produced for 'lme_slope' — skipping", and **still
+   exited 0/COMPLETED** — this failure mode does not show up as a failed
+   SLURM job, only as stale output timestamps/values. Fixed by throttling the
+   array to 2 concurrent tasks (`--array=0-11%2` in
+   `submit_phase4b_full_sweep.sh`); task 3 alone was resubmitted
+   (`sbatch --array=3 ...`, job 322562) and is in flight as of this writing.
+   Re-check `phase4b_*.out` logs for "CUDA out of memory" / "No attribution
+   maps produced" after any future sweep run, since a clean SLURM exit status
+   does not guarantee valid output.
+4. **`lme_slope` and `lme_slope_change` rows are numerically identical**
    (both datasets, all three weight types) — this is expected, not a bug:
    `aggregations.lme_slope_change` is defined (`brainage_agg/agg/aggregations.py:112-123`)
    to return the *same* per-subject BLUP slope as `lme_slope`; Arm A vs Arm B

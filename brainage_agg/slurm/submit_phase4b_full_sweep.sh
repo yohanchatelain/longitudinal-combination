@@ -15,6 +15,19 @@
 #                                                + ~6min PassB) ~= ~122h
 # --time below gives generous headroom over the concatenation estimate.
 #
+# Array throttled to 2 concurrent tasks (%2): the gpu partition's only node
+# (cgpu01) has no SLURM GRES/GPU accounting configured (`scontrol show node
+# cgpu01` reports Gres=(null)), so nothing stops the scheduler from packing
+# more array tasks onto it than its one ~14.6GB GPU can hold. Job 319349
+# (2026-07-16) had 4 tasks land on it concurrently and silently lost one
+# (task 3, NKI lme_slope): every subject's gradient computation hit CUDA OOM,
+# the run logged "No attribution maps produced -- skipping" and still exited
+# 0/COMPLETED, leaving that cell's output file untouched from a prior run.
+# 2 tasks x ~4.3GB fits with headroom (the OOM needed 4 tasks x ~4.3GB
+# against a 14.58GB card). Re-check `brainage_agg/slurm/logs/phase4b_*.out`
+# for "CUDA out of memory" / "No attribution maps produced" after any future
+# run regardless -- this failure mode does not show up as a failed job.
+#
 # Usage (from project root):
 #   sbatch brainage_agg/slurm/submit_phase4b_full_sweep.sh
 
@@ -25,7 +38,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=144:00:00
-#SBATCH --array=0-11
+#SBATCH --array=0-11%2
 
 set -euo pipefail
 
