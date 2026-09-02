@@ -13,13 +13,14 @@ from .gate0 import (
     recompute_batchnorm_running_stats,
     run_gate0,
 )
-from .model import load_simclr_backbone
+from .model import load_simclr_backbone, prefetch_checkpoint
 
 __all__ = [
     "Gate0Result",
     "activation_statistics",
     "linear_probe_check",
     "load_simclr_backbone",
+    "prefetch_checkpoint",
     "recompute_batchnorm_running_stats",
     "run_gate0",
 ]
