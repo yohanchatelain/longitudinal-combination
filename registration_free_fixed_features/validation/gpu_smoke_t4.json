@@ -1,0 +1,25 @@
+{
+  "cpu_seconds": 5.155024375766516,
+  "finite": true,
+  "gpu_seconds": 1.242292370647192,
+  "job_id": 366839,
+  "max_absolute_error": 0.000732421875,
+  "n_features": 377,
+  "peak_cuda_memory_bytes": 340061184,
+  "relative_l2_error": 1.3053111972691851e-07,
+  "runtime": {
+    "backend": "torch",
+    "cuda_version": "12.1",
+    "deterministic": true,
+    "device": "cuda",
+    "device_name": "Tesla T4",
+    "torch_convolution": "auto",
+    "torch_version": "2.5.1+cu121"
+  },
+  "shape": [
+    48,
+    48,
+    48
+  ],
+  "speedup": 4.149606403105352
+}

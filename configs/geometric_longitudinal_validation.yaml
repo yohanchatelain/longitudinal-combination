@@ -1,0 +1,117 @@
+schema_version: 1
+study: geometric_longitudinal_validation
+status: preregistered
+related_study:
+  confirmatory_v1_run_id: confirmatory_v1
+  relationship: exploratory_diagnostic_only  # plan §10: never pooled with this study
+
+output:
+  root: outputs/geometric_validation
+
+data:
+  cohorts:
+    nki:
+      config: brainage_agg/config.yaml
+    ppmi:
+      config: brainage_agg/ppmi_config.yaml
+  parcellation: aparc+aseg.mgz
+
+preprocessing:
+  scaler: minmax
+  channels: [t1, rank, sobel]
+  clip_low: 1
+  clip_high: 99
+  rank_size: 3
+  attribution_downsample_factor: 2
+
+deformation:
+  # plan §3.1's synthetic longitudinal conditions, minus the reduced grid's amplitude
+  # duplication (plan §7 removes redundant mean-aggregation cells, not conditions).
+  conditions:
+    exact_duplicate: {}
+    resampling_sham:
+      max_translation_voxels: 0.5
+      max_rotation_degrees: 1.0
+    hippocampus_contract_02: {target: hippocampus, direction: contract, target_change_pct: -2.0}
+    hippocampus_contract_05: {target: hippocampus, direction: contract, target_change_pct: -5.0}
+    hippocampus_contract_10: {target: hippocampus, direction: contract, target_change_pct: -10.0}
+    hippocampus_expand_05: {target: hippocampus, direction: expand, target_change_pct: 5.0}
+    cerebellar_wm_contract_05: {target: cerebellar_white_matter, direction: contract, target_change_pct: -5.0}
+  targets:
+    hippocampus:
+      left_labels: [17]
+      right_labels: [53]
+      sigma_voxels: 4.0
+    cerebellar_white_matter:
+      left_labels: [7]
+      right_labels: [46]
+      sigma_voxels: 4.0
+      adversarial_edge_prior: true
+  qc:
+    tolerance_pct: 0.5
+    max_outside_change_pct: 2.0
+    max_boundary_gradient: 0.5
+    magnitude_bounds: [0.0, 1.0]
+    calibration_max_iterations: 40
+
+cnn:
+  # plan §7 reduced grid: 2 cohorts x 2 architectures x 2 targets x 5 seeds = 40 cells,
+  # doubled by the raw/invariant variant axis (architecture §2.2).
+  architectures: [double_conv, cov_pool]
+  variants: [raw, invariant]
+  seeds: [0, 1, 2, 3, 4]
+  trained:
+    label: age
+    held_out_from: [pilot, validation]
+    checkpoint_dir: outputs/geometric_validation/checkpoints
+    max_epochs: 100
+    patience: 10
+    learning_rate: 1.0e-3
+    weight_decay: 1.0e-4
+    batch_size: 4
+
+invariance:
+  determinism:
+    tolerance: 1.0e-4
+  filter:
+    kind: gaussian_lowpass
+    cutoff_candidates: [0.0, 1.0, 2.0, 3.0]
+    min_dose_retention_fraction: 0.8
+  self_calibration:
+    k_null_resamples: 5
+    max_translation_voxels: 0.5
+    max_rotation_degrees: 1.0
+
+decoder:
+  kind: ridge
+  alphas: [0.01, 0.1, 1.0, 10.0, 100.0]
+  fit_on: calibration_subjects_only
+
+fastsurfer:  # plan §5.3 amendment (2026-09-02): replaces recon-all cross-sectional/
+             # longitudinal streams -- FastSurfer has no longitudinal mode, so each
+             # timepoint is processed independently (see plan §5.3's noise-suppression
+             # limitation note). Unblocked: containers/fastsurfer-cpu.sif verified.
+  container: containers/fastsurfer-cpu.sif
+  mode: seg_only  # FastSurferVINN only; no recon-surf, no FreeSurfer license needed
+  rois: [hippocampus, cerebellar_white_matter]
+  icv_adjust: true
+
+morphometry_baseline:  # blocked: see architecture doc §6, open question 2
+  method: TBD
+  tool: TBD
+
+subjects:
+  validation_per_cohort: 20
+  pilot_per_cohort: 20
+  expansion_per_cohort: 50
+  assignment_seed: 20260902
+
+decision_gates:
+  calibration:
+    fpr_max: 0.05
+    upper_ci_max: 0.10
+  superiority:
+    min_improvement_pct: 20.0
+    max_single_seed_share: 0.5
+  invariant_vs_raw:
+    max_auroc_reduction: 0.05

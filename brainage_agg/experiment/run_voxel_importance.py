@@ -25,10 +25,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 import warnings
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 import nibabel as nib
@@ -59,6 +62,8 @@ from brainage_agg.analysis.permutation_null import (
     derive_threshold,
     null_correction,
 )
+from brainage_agg.validation.statistics import empirical_region_pvalues
+from brainage_agg.validation.provenance import environment_snapshot, git_state, sha256_file
 from brainage_agg.analysis.group_diff import (
     _get_dataset_config,
     build_aggregated_vectors,
@@ -222,6 +227,8 @@ def _attribute_one_subject(
     device: str,
     downsample_factor: int,
     null_weight_sets: list[dict[str, np.ndarray]] | None = None,
+    allow_cpu_fallback: bool = True,
+    null_map_callback: Callable[[int, str, np.ndarray, np.ndarray], None] | None = None,
 ) -> tuple[
     dict[str, tuple[np.ndarray, np.ndarray]],
     dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
@@ -262,6 +269,8 @@ def _attribute_one_subject(
                         cache, null_weight_sets[pi][weight_type], n_model_feat,
                         retain_graph=not is_last,
                     )
+                    if null_map_callback is not None:
+                        null_map_callback(pi, weight_type, signed_map, abs_map)
                     acc_signed.update(signed_map)
                     acc_abs.update(abs_map)
                 mean_s, var_s = acc_signed.finalize()
@@ -270,11 +279,16 @@ def _attribute_one_subject(
 
         return observed, null
     except RuntimeError as exc:
-        if "out of memory" in str(exc).lower() and "cuda" in str(device):
+        if (
+            allow_cpu_fallback
+            and "out of memory" in str(exc).lower()
+            and "cuda" in str(device)
+        ):
             torch.cuda.empty_cache()
             return _attribute_one_subject(
                 model, x_tensor, weights, weight_types, "cpu", downsample_factor,
-                null_weight_sets,
+                null_weight_sets, allow_cpu_fallback,
+                null_map_callback,
             )
         raise
 
@@ -648,6 +662,8 @@ def run(
     rf_min_samples_leaf: int = 5,
     n_permutations: int = 0,
     null_rng_seed: int = 0,
+    strict_complete: bool = False,
+    validation_output_dir: Path | None = None,
 ) -> None:
     weight_types = weight_types or ["tstat"]
     ds_cfg = _get_dataset_config(dataset, project_root)
@@ -673,6 +689,8 @@ def run(
             f"in {feature_dir}"
         )
     if n_seeds is not None:
+        if strict_complete and len(npz_files) < n_seeds:
+            raise RuntimeError(f"Requested {n_seeds} seeds but found only {len(npz_files)}")
         npz_files = npz_files[:n_seeds]
     print(
         f"Found {len(npz_files)} seed(s) for "
@@ -711,6 +729,8 @@ def run(
 
     # --- Sample subjects ---
     sampled = _sample_subjects(cohort, groups, n_subjects, manifest)
+    if strict_complete and len(sampled) != n_subjects:
+        raise RuntimeError(f"Requested {n_subjects} balanced subjects but sampled {len(sampled)}")
     print(
         f"Sampled {len(sampled)} subjects "
         f"({(sampled['_band'] == group_a).sum()} {group_a}, "
@@ -752,8 +772,11 @@ def run(
         f"{len(cached_subjects)}/{len(sampled)} subjects valid (arr + parcellation)"
     )
     if not cached_subjects:
-        print("No valid subjects after preprocessing — aborting.")
-        return
+        raise RuntimeError("No valid subjects after preprocessing")
+    if strict_complete and len(cached_subjects) != len(sampled):
+        raise RuntimeError(
+            f"Preprocessing produced {len(cached_subjects)}/{len(sampled)} requested subjects"
+        )
 
     # Grab affine from first valid subject for NIfTI export
     first_affine = next((aff for _, _, aff in cached_subjects if aff is not None), None)
@@ -779,6 +802,8 @@ def run(
         print(f"{'='*60}")
 
         out_dir = result_dir / "group_diff" / "voxel_importance" / aggregation
+        if validation_output_dir is not None:
+            out_dir = Path(validation_output_dir) / dataset / arch / aggregation
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Pass A: compute per-seed raw importance weights ---
@@ -787,6 +812,11 @@ def run(
             print(f"  Importance weights: {npz_path.name} ...", end=" ", flush=True)
             agg_result = _build_aggregated_features(npz_path, manifest, aggregation, groups)
             if agg_result is None:
+                if strict_complete:
+                    raise RuntimeError(
+                        f"Insufficient data for requested seed file {npz_path.name} "
+                        f"and aggregation {aggregation}"
+                    )
                 print("skipped (insufficient data)")
                 continue
             X_agg, bands_agg, seed = agg_result
@@ -796,6 +826,9 @@ def run(
                 rf_permutation_repeats=rf_permutation_repeats,
                 rf_min_samples_leaf=rf_min_samples_leaf,
             )
+            missing_weights = set(weight_types) - set(weights)
+            if missing_weights:
+                raise RuntimeError(f"Missing requested weight types: {sorted(missing_weights)}")
             seed_weights.append((seed, X_agg, bands_agg, weights))
             n_feat = next(iter(weights.values())).shape[0]
             print(f"done  n_feat={n_feat}")
@@ -868,6 +901,33 @@ def run(
         region_z_signed_accum:         dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
         region_z_abs_accum:            dict[str, dict[int, list[float]]] = {wt: {} for wt in weight_types}
 
+        # Confirmatory regional null: retain every permutation's regional
+        # statistic. Keys are (seed, permutation_index, label_id); values are
+        # subject-level region means, averaged only when materializing output.
+        permutation_region_abs: dict[str, dict[tuple[int, int, int], list[float]]] = {
+            wt: {} for wt in weight_types
+        }
+        permutation_region_signed: dict[str, dict[tuple[int, int, int], list[float]]] = {
+            wt: {} for wt in weight_types
+        }
+        observed_region_abs_by_seed: dict[str, dict[tuple[int, int], list[float]]] = {
+            wt: {} for wt in weight_types
+        }
+        observed_region_signed_by_seed: dict[str, dict[tuple[int, int], list[float]]] = {
+            wt: {} for wt in weight_types
+        }
+        corrected_region_abs_by_seed: dict[str, dict[tuple[int, int], list[float]]] = {
+            wt: {} for wt in weight_types
+        }
+        z_region_abs_by_seed: dict[str, dict[tuple[int, int], list[float]]] = {
+            wt: {} for wt in weight_types
+        }
+        expected_region_subjects: dict[int, int] = {}
+        for _, subject_parcellation, _, _ in cached_tensors:
+            for label_id in np.unique(subject_parcellation):
+                if int(label_id) != 0:
+                    expected_region_subjects[int(label_id)] = expected_region_subjects.get(int(label_id), 0) + 1
+
         n_maps_total = 0
 
         for seed, _, _, weights in seed_weights:
@@ -886,12 +946,38 @@ def run(
             per_seed_abs:    dict[str, list[np.ndarray]] = {wt: [] for wt in weight_types}
 
             for x_tensor, parc, _, brain_mask in cached_tensors:
+                def retain_permutation_region(
+                    permutation_index: int,
+                    weight_type: str,
+                    signed_map: np.ndarray,
+                    abs_map: np.ndarray,
+                ) -> None:
+                    signed_copy = signed_map.copy()
+                    abs_copy = abs_map.copy()
+                    signed_copy[~brain_mask] = 0.0
+                    abs_copy[~brain_mask] = 0.0
+                    regional_signed, regional_abs = project_to_atlas(signed_copy, abs_copy, parc)
+                    for label_id, (value, _) in regional_abs.items():
+                        permutation_region_abs[weight_type].setdefault(
+                            (seed, permutation_index, label_id), []
+                        ).append(value)
+                    for label_id, (value, _) in regional_signed.items():
+                        permutation_region_signed[weight_type].setdefault(
+                            (seed, permutation_index, label_id), []
+                        ).append(value)
+
                 try:
                     results, null_results = _attribute_one_subject(
                         model, x_tensor, weights, weight_types, device, downsample_factor,
                         null_weight_sets=seed_null_weights,
+                        allow_cpu_fallback=not strict_complete,
+                        null_map_callback=(retain_permutation_region if n_permutations > 0 else None),
                     )
                 except RuntimeError as exc:
+                    if strict_complete:
+                        raise RuntimeError(
+                            f"Gradient computation failed for seed={seed}: {exc}"
+                        ) from exc
                     print(f"    Gradient computation failed: {exc}")
                     continue
 
@@ -907,6 +993,15 @@ def run(
                         region_signed_accum[weight_type], region_abs_accum[weight_type],
                         region_nvox[weight_type],
                     )
+                    current_signed, current_abs = project_to_atlas(signed_map, abs_map, parc)
+                    for label_id, (value, _) in current_abs.items():
+                        observed_region_abs_by_seed[weight_type].setdefault(
+                            (seed, label_id), []
+                        ).append(value)
+                    for label_id, (value, _) in current_signed.items():
+                        observed_region_signed_by_seed[weight_type].setdefault(
+                            (seed, label_id), []
+                        ).append(value)
 
                     if weight_type in null_results:
                         null_mean_s, null_var_s, null_mean_a, null_var_a = null_results[weight_type]
@@ -934,6 +1029,18 @@ def run(
                             z_signed, z_abs, parc,
                             region_z_signed_accum[weight_type], region_z_abs_accum[weight_type],
                         )
+                        _, corrected_regions_abs = project_to_atlas(
+                            corrected_signed, corrected_abs, parc
+                        )
+                        _, z_regions_abs = project_to_atlas(z_signed, z_abs, parc)
+                        for label_id, (value, _) in corrected_regions_abs.items():
+                            corrected_region_abs_by_seed[weight_type].setdefault(
+                                (seed, label_id), []
+                            ).append(value)
+                        for label_id, (value, _) in z_regions_abs.items():
+                            z_region_abs_by_seed[weight_type].setdefault(
+                                (seed, label_id), []
+                            ).append(value)
 
                 n_maps_total += 1
 
@@ -1010,6 +1117,109 @@ def run(
             region_df.to_csv(csv_path, index=False)
             print(f"  Saved {csv_path.name} ({len(region_df)} regions)")
 
+            if n_permutations > 0:
+                label_ids = np.array(sorted(region_abs_accum[weight_type]), dtype=np.int32)
+                seeds_used = np.array([seed for seed, *_ in seed_weights], dtype=np.int32)
+                permutation_abs = np.empty(
+                    (len(seeds_used), n_permutations, len(label_ids)), dtype=np.float32
+                )
+                permutation_signed = np.empty_like(permutation_abs)
+                for seed_index, current_seed in enumerate(seeds_used):
+                    for permutation_index in range(n_permutations):
+                        for label_index, label_id in enumerate(label_ids):
+                            abs_values = permutation_region_abs[weight_type].get(
+                                (int(current_seed), permutation_index, int(label_id)), []
+                            )
+                            signed_values = permutation_region_signed[weight_type].get(
+                                (int(current_seed), permutation_index, int(label_id)), []
+                            )
+                            if strict_complete and (
+                                len(abs_values) != expected_region_subjects.get(int(label_id), 0)
+                                or len(signed_values) != expected_region_subjects.get(int(label_id), 0)
+                            ):
+                                raise RuntimeError(
+                                    "Missing permutation-region statistic for "
+                                    f"seed={current_seed}, permutation={permutation_index}, "
+                                    f"label={label_id}, weight={weight_type}"
+                                )
+                            permutation_abs[seed_index, permutation_index, label_index] = np.mean(abs_values)
+                            permutation_signed[seed_index, permutation_index, label_index] = np.mean(signed_values)
+                observed_abs = np.array(
+                    [np.mean(region_abs_accum[weight_type][int(label)]) for label in label_ids],
+                    dtype=np.float32,
+                )
+                observed_signed = np.array(
+                    [np.mean(region_signed_accum[weight_type][int(label)]) for label in label_ids],
+                    dtype=np.float32,
+                )
+                observed_abs_by_seed = np.empty(
+                    (len(seeds_used), len(label_ids)), dtype=np.float32
+                )
+                observed_signed_by_seed = np.empty_like(observed_abs_by_seed)
+                corrected_abs_by_seed = np.empty_like(observed_abs_by_seed)
+                z_abs_by_seed = np.empty_like(observed_abs_by_seed)
+                for seed_index, current_seed in enumerate(seeds_used):
+                    for label_index, label_id in enumerate(label_ids):
+                        seed_abs = observed_region_abs_by_seed[weight_type].get(
+                            (int(current_seed), int(label_id)), []
+                        )
+                        seed_signed = observed_region_signed_by_seed[weight_type].get(
+                            (int(current_seed), int(label_id)), []
+                        )
+                        if strict_complete and (
+                            len(seed_abs) != expected_region_subjects.get(int(label_id), 0)
+                            or len(seed_signed) != expected_region_subjects.get(int(label_id), 0)
+                        ):
+                            raise RuntimeError(
+                                f"Missing observed region statistic for seed={current_seed}, "
+                                f"label={label_id}, weight={weight_type}"
+                            )
+                        observed_abs_by_seed[seed_index, label_index] = np.mean(seed_abs)
+                        observed_signed_by_seed[seed_index, label_index] = np.mean(seed_signed)
+                        corrected_values = corrected_region_abs_by_seed[weight_type].get(
+                            (int(current_seed), int(label_id)), []
+                        )
+                        z_values = z_region_abs_by_seed[weight_type].get(
+                            (int(current_seed), int(label_id)), []
+                        )
+                        if strict_complete and (
+                            len(corrected_values) != expected_region_subjects.get(int(label_id), 0)
+                            or len(z_values) != expected_region_subjects.get(int(label_id), 0)
+                        ):
+                            raise RuntimeError(
+                                f"Missing corrected region statistic for seed={current_seed}, "
+                                f"label={label_id}, weight={weight_type}"
+                            )
+                        corrected_abs_by_seed[seed_index, label_index] = np.mean(corrected_values)
+                        z_abs_by_seed[seed_index, label_index] = np.mean(z_values)
+                # Average matched permutation indices across seeds; the seed
+                # dimension is retained in the NPZ for seed-bootstrap analysis.
+                pointwise_p, maxT_p = empirical_region_pvalues(
+                    observed_abs, permutation_abs.mean(axis=0), alternative="greater"
+                )
+                p_by_label = {int(label): float(p) for label, p in zip(label_ids, pointwise_p)}
+                maxT_by_label = {int(label): float(p) for label, p in zip(label_ids, maxT_p)}
+                region_df["empirical_p_one_sided"] = region_df["label_id"].map(p_by_label)
+                region_df["maxT_fwer_p"] = region_df["label_id"].map(maxT_by_label)
+                region_df.to_csv(csv_path, index=False)
+                permutation_path = out_dir / f"permutation_region_stats_{extractor_key}.npz"
+                np.savez_compressed(
+                    permutation_path,
+                    label_ids=label_ids,
+                    seeds=seeds_used,
+                    observed_abs=observed_abs,
+                    observed_signed=observed_signed,
+                    observed_abs_by_seed=observed_abs_by_seed,
+                    observed_signed_by_seed=observed_signed_by_seed,
+                    corrected_abs_by_seed=corrected_abs_by_seed,
+                    empirical_standardized_abs_by_seed=z_abs_by_seed,
+                    permutation_abs=permutation_abs,
+                    permutation_signed=permutation_signed,
+                    pointwise_p_one_sided=pointwise_p,
+                    maxT_fwer_p=maxT_p,
+                )
+                print(f"  Saved {permutation_path.name} (permutation-indexed regional null)")
+
             # --- Bar plot ---
             _make_barplot(
                 region_df,
@@ -1039,6 +1249,60 @@ def run(
                         title=f"CNN vs FS ROI — {aggregation} ({weight_type})",
                         out_path=out_dir / f"cnn_vs_roi_scatter_{extractor_key}.png",
                     )
+
+        if validation_output_dir is not None:
+            seeds_used = [int(current_seed) for current_seed, *_ in seed_weights]
+            cell = {
+                "kind": "null",
+                "cohort": dataset,
+                "architecture": arch,
+                "aggregation": aggregation,
+                "seeds": seeds_used,
+                "weight_types": list(weight_types),
+                "n_subjects": int(n_subjects),
+                "n_permutations": int(n_permutations),
+            }
+            resolved = {
+                "cell": cell,
+                "scaler": scaler,
+                "channels": channels,
+                "downsample_factor": int(downsample_factor),
+                "null_rng_seed": int(null_rng_seed),
+                "strict_complete": bool(strict_complete),
+                "git": git_state(project_root),
+                "environment": environment_snapshot(),
+                "subject_ids": sorted(sampled["id"].astype(str).tolist()),
+            }
+            resolved_path = out_dir / "resolved_run.json"
+            resolved_path.write_text(json.dumps(resolved, indent=2, sort_keys=True) + "\n")
+            subject_path = out_dir / "subject_ids.json"
+            subject_path.write_text(json.dumps(resolved["subject_ids"], indent=2) + "\n")
+            artifact_paths = [
+                path for path in sorted(out_dir.iterdir())
+                if path.is_file() and path.name != "null_cell_manifest.json"
+            ]
+            required_npz = list(out_dir.glob("permutation_region_stats_*.npz"))
+            if strict_complete and len(required_npz) != len(weight_types):
+                raise RuntimeError(
+                    f"Expected {len(weight_types)} permutation NPZ files, found {len(required_npz)}"
+                )
+            cell_manifest = {
+                "schema_version": 1,
+                "status": "complete",
+                "cell": cell,
+                "artifacts": [
+                    {
+                        "path": path.name,
+                        "sha256": sha256_file(path),
+                        "size_bytes": path.stat().st_size,
+                    }
+                    for path in artifact_paths
+                ],
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            temporary = out_dir / "null_cell_manifest.json.tmp"
+            temporary.write_text(json.dumps(cell_manifest, indent=2, sort_keys=True) + "\n")
+            temporary.replace(out_dir / "null_cell_manifest.json")
 
     print(f"\nDone. Results written to {result_dir}/group_diff/voxel_importance/")
 
@@ -1152,6 +1416,16 @@ def main() -> None:
         help="Base RNG seed for group-label permutations (offset by CNN seed "
              "per seed for reproducibility). Default: 0.",
     )
+    parser.add_argument(
+        "--strict-complete", action="store_true",
+        help="Confirmatory mode: fail nonzero on any missing seed, subject, map, "
+             "weight type, permutation, or CUDA error; disables CPU fallback.",
+    )
+    parser.add_argument(
+        "--validation-output-dir", type=Path, default=None,
+        help="Write confirmatory artifacts under this versioned directory instead "
+             "of the exploratory Phase 4b output tree.",
+    )
     args = parser.parse_args()
 
     run(
@@ -1173,6 +1447,8 @@ def main() -> None:
         rf_min_samples_leaf=args.rf_min_samples_leaf,
         n_permutations=args.n_permutations,
         null_rng_seed=args.null_rng_seed,
+        strict_complete=args.strict_complete,
+        validation_output_dir=args.validation_output_dir,
     )
 
 

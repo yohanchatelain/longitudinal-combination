@@ -1,14 +1,15 @@
 # --- Large data outputs (never version raw data or extracted features) ---
 outputs/
 PPMI_data/
-/ppmi/
+ppmi/
+PPMI_data/
 brainage_agg/features/
 brainage_agg/outputs/
 brainage_agg/ppmi_outputs/
 
 # NKI_FreeSurfer is a datalad repo; commit only the cohort metadata files,
 # not the binary FreeSurfer outputs under freesurfer/
-NKI_FreeSurfer/freesurfer/
+NKI_FreeSurfer/
 
 # --- Python artifacts ---
 .venv/
@@ -31,3 +32,7 @@ brainage_agg/slurm/logs/
 
 # --- Notebooks: keep .ipynb files, but outputs are stripped before commit ---
 # (run: jupyter nbconvert --clear-output --inplace <notebook>.ipynb)
+
+# --- Container images (large binaries, pulled/built locally, never versioned) ---
+containers/
+*.sif

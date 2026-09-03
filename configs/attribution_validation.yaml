@@ -1,0 +1,108 @@
+schema_version: 1
+study: attribution_validation
+status: preregistered
+exploratory_source:
+  description: Existing six-aggregation, ten-seed voxel-attribution sweep
+  confirmatory: false
+
+output:
+  root: outputs/attribution_validation
+
+data:
+  cohorts:
+    nki:
+      config: brainage_agg/config.yaml
+    ppmi:
+      config: brainage_agg/ppmi_config.yaml
+  parcellation: aparc+aseg.mgz
+
+preprocessing:
+  scaler: minmax
+  channels: [t1, rank, sobel]
+  clip_low: 1
+  clip_high: 99
+  rank_size: 3
+  attribution_downsample_factor: 2
+
+injection:
+  architectures: [double_conv, cov_pool]
+  aggregations: [mean, annualized_rate]
+  weight_types: [tstat, shap, hybrid]
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  assignment_seed: 20260828
+  validation_subjects: 50
+  pilot_subjects: 20
+  amplitudes: [0.02, 0.05, 0.10]
+  calibration_target_cohens_d: 0.8
+  taper_boundary_voxels: 2
+  targets:
+    putamen:
+      left_labels: [12]
+      right_labels: [51]
+      tissue_class: subcortical_gray
+    hippocampus:
+      left_labels: [17]
+      right_labels: [53]
+      tissue_class: subcortical_gray
+    superior_frontal:
+      left_labels: [1028]
+      right_labels: [2028]
+      tissue_class: cortical_gray
+    cerebellar_white_matter:
+      left_labels: [7]
+      right_labels: [46]
+      tissue_class: white_matter
+      adversarial_edge_prior: true
+
+cohort_null:
+  architecture: double_conv
+  aggregations: [mean, annualized_rate]
+  weight_types: [tstat, shap, hybrid]
+  seeds: [0, 1, 2, 3, 4]
+  n_subjects: 50
+  n_permutations: 199
+  permutation_seed: 20260829
+  max_concurrent_gpu_tasks: 2
+  alpha: 0.05
+
+controls:
+  unit_weight_inputs: [mean_brain, constant_masked, phase_scrambled]
+  empirical_targets: [age, sex, severity, unit_prior]
+  similarity: pearson
+  bootstrap_samples: 2000
+  bootstrap_seed: 20260830
+  roi_permutation_strata: [hemisphere, tissue_class, region_volume_quintile]
+
+decision_gates:
+  localization:
+    voxel_auroc_min: 0.75
+    voxel_auroc_lower_min: 0.50
+    normalized_auprc_lift_min: 2.0
+    normalized_auprc_lift_lower_min: 1.0
+    bilateral_top5_hit_rate_min: 0.80
+  null_calibration:
+    maxT_fwer_max: 0.05
+    maxT_fwer_upper_max: 0.10
+  specificity:
+    paired_difference_lower_min: 0.0
+  reproducibility:
+    require_all_cohorts: true
+    require_all_architectures: true
+
+artifacts:
+  required_per_cell:
+    - metrics.csv
+    - regional_stats.csv
+    - voxel_map_abs.nii.gz
+    - voxel_map_signed.nii.gz
+    - injection_mask.nii.gz
+    - provenance.csv
+  required_report:
+    - validation_summary.csv
+    - permutation_region_stats.npz
+    - decision.json
+    - figure_injected_localization.png
+    - figure_null_calibration.png
+    - figure_target_specificity.png
+    - figure_roi_concordance.png
+    - manuscript_attribution_validation.md

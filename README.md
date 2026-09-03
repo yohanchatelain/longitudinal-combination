@@ -14,6 +14,7 @@ Benchmarks untrained, randomly-initialized 3D CNNs against FreeSurfer ROI featur
 6. [Data Assumptions](#data-assumptions)
 7. [Leakage Control](#leakage-control)
 8. [Install](#install)
+9. [Registration-Free Fixed Feature Plan](#registration-free-fixed-feature-plan)
 
 ---
 
@@ -33,6 +34,205 @@ Two cohorts are supported:
 |--------|--------|------|
 | NKI (Rockland) | Child vs Adult | Brain age prediction |
 | PPMI | PD vs Healthy Control | Parkinson's disease classification |
+
+> **Interpretation status.** The existing 36-cell voxel-attribution sweep is
+> exploratory. Its regional maps must not be interpreted as biological
+> localization unless the preregistered positive-control, maxT calibration,
+> and target-specificity gates in `configs/attribution_validation.yaml` pass.
+
+---
+
+## Registration-Free Fixed Feature Plan
+
+This extension will test whether a deterministic physical-space representation
+can replace registration-dependent features. The representation has no weights
+fitted to this project's images or outcomes; only the downstream prediction
+model is trained. The confirmatory question is whether it retains useful brain
+morphology while reducing sensitivity to acquisition and pose nuisances.
+
+### Operational definition and data boundary
+
+- The primary input is the original raw T1-weighted image and its complete
+  NIfTI/MGZ affine. FreeSurfer `brain.mgz`, `brainmask.mgz`, and parcellations are
+  not valid primary inputs because they have already been conformed and inherit
+  FreeSurfer preprocessing. They remain registered comparison baselines only.
+- "Registration-free" means no atlas alignment, inter-visit alignment,
+  optimized affine/deformation field, or learned representation encoder.
+  Lossless array-axis permutation and flipping to canonical RAS+ orientation is
+  allowed and recorded; it does not interpolate voxel values or align anatomy.
+- A frozen third-party brain-extraction procedure may be used as preprocessing,
+  but it must be selected before confirmatory evaluation, must not be trained or
+  fine-tuned on either cohort, and must be identified by model/tool hash. Its
+  contribution is evaluated separately from the fixed representation.
+- The target is stability to acquisition resolution, added background,
+  non-cropping pose changes, noise, bias field, and monotone intensity changes.
+  The method does **not** claim invariance to missing anatomy or anatomical
+  scale: brain size and genuine atrophy are signals that should remain visible.
+
+The raw-image manifest must include subject and visit identifiers, image path,
+input checksum, affine, voxel spacing, orientation, dimensions, scanner/site
+when available, and elapsed time. All visits from a subject must enter the same
+cross-validation fold.
+
+### Native-space preprocessing and quality control
+
+Each visit is processed independently in this fixed order:
+
+1. Validate the affine, finite intensities, supported dimensionality, and full
+   brain coverage. Reject truncated brains rather than treating missing tissue
+   as a nuisance transformation.
+2. Reorient to canonical RAS+ with axis permutation/flipping only. Reject or
+   separately flag images whose affine contains unsupported shear or invalid
+   physical spacing.
+3. Apply a pinned N4 bias-field implementation with fixed parameters.
+4. Generate the brain mask with the locked external procedure. Apply fixed
+   topology, minimum-volume, boundary-contact, and left/right coverage QC;
+   never fall back silently to `image > 0`.
+5. Normalize intensities within the mask with a locked robust rule, including
+   fixed clipping percentiles and explicit handling of constant or nearly
+   constant images. Set background to zero.
+6. Retain the native physical grid. Do not conform or resize the primary input
+   to a template shape.
+
+Save the corrected image and mask checksums, QC measurements, voxel-to-world
+affine, physical field of view, mask volume in mm³, software versions, and any
+warning or rejection reason. A manually reviewed stratified subset will measure
+mask failure rates by cohort, site, and diagnostic group before prediction is
+evaluated.
+
+### Locked fixed representation
+
+The primary extractor is one pinned implementation of a 3D solid-harmonic
+scattering transform. "Equivalent wavelet bank" is not a confirmatory option.
+The configuration locks:
+
+- filter equations and normalization;
+- orders 0, 1, and 2 only;
+- physical radial scales in millimetres;
+- angular orders and orientation-energy pooling;
+- averaging scale, padding, boundary correction, and mask erosion rules;
+- numerical precision, backend version, and deterministic execution settings;
+- coefficient names, ordering, and invalid-value policy.
+
+Filters are discretized from the voxel-to-world metric, not from voxel indices
+alone, so anisotropic spacing is represented in physical units. A scan is
+rejected if its spacing or affine is outside the preregistered supported range.
+Unit tests on analytic phantoms must show that every supported grid produces the
+same coefficient names and acceptably close values before cohort extraction.
+
+Orientation pooling and spatial averaging are expected to improve stability;
+they do not imply exact invariance. Likewise, multiple physical filter scales
+address acquisition sampling but do not normalize anatomical size. These are
+empirical properties assessed by the locked robustness tests below.
+
+### Registration-free spatial summaries
+
+The primary feature vector contains, for every scattering coefficient:
+
+1. a whole-mask summary; and
+2. summaries over four concentric intrinsic radial shells defined by physical
+   distance from the mask centroid, normalized only for shell assignment.
+
+Radial shells retain coarse center-to-periphery information without imposing
+voxelwise or axis-aligned regional correspondence. Their continuous-space
+definition is rotation-invariant; discretization error is measured in the
+phantom and perturbation tests. Mask volume, rotation-invariant principal-axis
+lengths, and intensity quantiles are separate named covariates; they are never
+mixed into the scattering coefficients.
+
+Axis-dependent grids, octants, and hemispheric summaries are excluded from the
+primary rotation-robust representation. A preregistered secondary analysis may
+add left/right summaries only for scans passing orientation QC, and must label
+the resulting feature family as orientation-dependent.
+
+### Longitudinal representation
+
+Extract one visit-level vector independently for every scan. For subjects with
+two visits, compare these non-redundant, preregistered candidates:
+
+- baseline state \(f(t_0)\);
+- endpoint mean plus annualized change
+  \([(f(t_0)+f(t_1))/2,\; (f(t_1)-f(t_0))/\Delta t]\); and
+- annualized change alone.
+
+Do not concatenate \(f(t_0)\), \(f(t_1)\), and their exact difference in the
+same design matrix. For three or more visits, the longitudinal candidate is the
+per-subject intercept at a fixed reference time plus a per-feature ordinary
+least-squares slope. Minimum/maximum elapsed-time rules and the treatment of
+irregular visits are locked in configuration before extraction.
+
+Representation choice is a model hyperparameter selected only within inner
+training folds. Elapsed time and number of visits are retained as explicit
+covariates and reported for every outer fold.
+
+### Common leakage-safe prediction protocol
+
+All feature families use one shared evaluator and identical saved outer folds:
+
+- subject-grouped nested cross-validation for NKI regression and PPMI
+  classification;
+- outcome-aware stratification where feasible, with a predefined fallback for
+  small strata;
+- fold-local feature scaling, near-zero-variance removal, optional feature
+  selection/dimensionality reduction, longitudinal-representation selection,
+  and hyperparameter selection;
+- a primary elastic-net linear/logistic model; RBF SVM and gradient-boosted
+  trees only as prespecified secondary models; and
+- paired fold-level comparisons with confidence intervals, not independent
+  comparisons of separately randomized splits.
+
+The same protocol evaluates the fixed representation, volume/intensity-only
+native-space features, FreeSurfer ROI features, and the existing frozen random
+CNN features. No outer-fold result may influence the extractor, perturbation
+settings, model search space, or acceptance criteria.
+
+### Robustness and signal-preservation validation
+
+Before confirmatory runs, a versioned configuration locks perturbation levels,
+random seeds, primary metrics, non-inferiority/superiority margins, and failure
+criteria. Development pilots may set those values, but pilot subjects and
+results are excluded from the confirmatory assessment.
+
+On held-out outer-fold subjects, apply deterministic perturbation sets for:
+
+- rigid rotations and translations with padding and verified complete brain
+  coverage;
+- resolution changes implemented by a documented downsample/reconstruction
+  operator;
+- added or removed background that never intersects the brain mask;
+- noise, smooth multiplicative bias fields, and monotone intensity transforms;
+- simulated focal volume loss at multiple locked doses; and
+- real test-retest scans when available.
+
+Run perturbations in two modes: first reuse the original mask to isolate the
+representation, then rerun N4 and brain extraction to measure the complete
+pipeline. Report coefficient-wise reliability, feature-vector cosine and
+standardized L2 change, prediction change/class flips, test-retest ICC, runtime,
+memory, QC rejection rate, and failures. Signal preservation is assessed by a
+monotone dose-response to simulated atrophy and by sensitivity to real
+longitudinal change. Robustness is accepted only if the preregistered prediction
+and feature-stability margins pass without failing the signal-preservation gate.
+
+### Reproducibility and implementation sequence
+
+Every artifact records the raw input and mask checksums, resolved configuration
+and its hash, feature schema version, dependency/container versions, thread and
+device settings, source commit, QC results, and fold assignment. Feature files
+are immutable and are written to a new versioned output directory.
+
+Implementation proceeds through explicit gates:
+
+1. add the raw-image manifest and preprocessing/QC command;
+2. implement the physical-space extractor and phantom invariance tests;
+3. define and validate the immutable feature schema;
+4. add the shared nested-CV regression/classification evaluator and saved paired
+   folds;
+5. run development-only feasibility and resource pilots;
+6. freeze the confirmatory configuration and acceptance margins; and
+7. run extraction, prediction, robustness tests, and a completeness/hash audit.
+
+The confirmatory campaign starts only after the raw-data boundary, mask audit,
+phantom tests, paired evaluator, and configuration freeze have all passed.
 
 ---
 
@@ -164,6 +364,41 @@ Dataset and aggregation method are selectable via dropdowns.
 ---
 
 ## Full Pipeline
+
+### Preregistered voxel-attribution validation
+
+The confirmatory campaign writes only under
+`outputs/attribution_validation/<run_id>/`; it does not overwrite the
+exploratory Phase 4b artifacts.
+
+```bash
+python -m brainage_agg.experiment.run_attribution_validation prepare \
+  --run-id confirmatory_v1
+
+# One array contains injection and architecture-prior cells and is capped at
+# two simultaneous GPU jobs.
+bash scripts/submit_attribution_validation.sh confirmatory_v1
+
+# 199-permutation regional null, also capped at two simultaneous GPU jobs.
+bash scripts/submit_attribution_null.sh confirmatory_v1
+
+# Exits nonzero until every requested cell and artifact is hash-valid.
+python -m brainage_agg.experiment.run_attribution_validation collect \
+  --run-id confirmatory_v1
+
+python -m brainage_agg.analysis.report_attribution_validation \
+  --run-dir outputs/attribution_validation/confirmatory_v1 \
+  --null-npz <nki-permutation-region-stats.npz> \
+  --null-npz <ppmi-permutation-region-stats.npz> \
+  --output outputs/attribution_validation/confirmatory_v1/paper
+```
+
+Each injected-effect cell attenuates the raw T1 volume before scaling, then
+recomputes all `t1_rank_sobel` channels. Completed cells record resolved
+configuration, commit state, subject IDs, RNG seeds, environment, hashes,
+subject-level provenance, maps, and regional metrics. CUDA errors and missing
+seeds, subjects, weights, maps, or permutations are fatal in confirmatory
+mode. ROI concordance is secondary and is never used as a decision gate.
 
 ### 1. Extract CNN features
 

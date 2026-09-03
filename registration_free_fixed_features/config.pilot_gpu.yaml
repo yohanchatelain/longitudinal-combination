@@ -1,0 +1,43 @@
+schema_version: rfff-1-pilot
+confirmatory: false
+
+qc:
+  min_spacing_mm: 0.5
+  max_spacing_mm: 3.0
+  max_shear_cosine: 0.001
+  min_mask_voxels: 1000
+  min_mask_volume_mm3: 50000
+  min_largest_component_fraction: 0.98
+  max_boundary_fraction: 0.02
+  min_side_fraction: 0.20
+
+preprocessing:
+  # Development pilot only. Confirmatory extraction must use simpleitk_n4.
+  bias_backend: none
+  n4_iterations: [50, 50, 30, 20]
+  clip_percentiles: [1.0, 99.0]
+  normalization: robust_zscore
+
+scattering:
+  scales_mm: [2.0, 4.0, 8.0]
+  angular_orders: [0, 1, 2]
+  max_order: 2
+  radial_shells: 4
+  summary_stats: [mean, std]
+  kernel_truncate_sigma: 3.5
+  boundary_erosion_mm: 1.0
+  dtype: float32
+  backend: torch
+  device: cuda
+  deterministic: true
+  torch_convolution: auto
+
+evaluation:
+  outer_folds: 5
+  inner_folds: 4
+  random_seed: 42
+  min_elapsed_years: 0.25
+  max_elapsed_years: 10.0
+  elastic_net_alphas: [0.001, 0.01, 0.1, 1.0]
+  elastic_net_l1_ratios: [0.1, 0.5, 0.9]
+  logistic_cs: [0.01, 0.1, 1.0, 10.0]

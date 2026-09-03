@@ -1,0 +1,55 @@
+{
+  "date": "2026-09-02",
+  "development_feature_artifact_sha256": "0afb5d4a8fd2306e410f50b476b6011d733db5b27d45b8d971931afc9223cf10",
+  "feature_comparison": {
+    "flattened_pearson": 0.9999046423922445,
+    "overall_relative_l2": 0.014982363132036223,
+    "per_scan_relative_l2_max": 0.028214568969085925,
+    "per_scan_relative_l2_mean": 0.010792071033406611,
+    "per_scan_relative_l2_min": 0.0001991718579314438,
+    "symmetric_relative_change_median": 0.0234316434607647,
+    "symmetric_relative_change_p95": 0.09443590756911029
+  },
+  "feature_extraction": {
+    "all_finite": true,
+    "artifact_sha256": "acbf3f95073ecdec106375d5d3333365d0c301859d465d819741de300816bc89",
+    "config_hash": "09ffa4ab51681885e8515772ba43793d5561bf1f3bfca97bbe5ae6b17b744f90",
+    "cuda_version": "12.1",
+    "device": "Tesla T4",
+    "extraction_seconds_total": 61.14121191203594,
+    "host_peak_rss_kib": 704328,
+    "job_elapsed": "00:01:22",
+    "job_id": 366861,
+    "n_features": 377,
+    "n_visits": 8,
+    "peak_cuda_mib": 7801.40625,
+    "preparation_seconds_total": 6.783686649054289,
+    "state": "COMPLETED"
+  },
+  "mask_generation": {
+    "container_sha256": "fea95be33f3e2d4102d513349b2d95266c8528015e6b4d708d2abbcf91e1e462",
+    "container_size_bytes": 382615552,
+    "dice_max": 0.9664020092466242,
+    "dice_mean": 0.9630287651082072,
+    "dice_min": 0.9595677507544121,
+    "host_peak_rss_kib": 7544248,
+    "job_elapsed": "00:03:39",
+    "job_id": 366860,
+    "largest_component_fraction_min": 1.0,
+    "mask_boundary_fraction_max": 0.0,
+    "mask_runtime_seconds_total": 199.0594035871327,
+    "mask_volume_mm3_max": 1663868.0,
+    "mask_volume_mm3_min": 1446320.0,
+    "n_visits": 8,
+    "state": "COMPLETED",
+    "upstream_manifest_digest": "sha256:ebbc177221194371f16362513ace68312a22922bb581bdfa618ac7ff9c1d2c06"
+  },
+  "notes": [
+    "All masks passed the locked image/mask QC contract.",
+    "The official SynthStrip 1.8 container has a CPU-only PyTorch build; mask generation used CPU threads.",
+    "The matched fixed-feature extraction used the deterministic CUDA backend.",
+    "This resource pilot is not confirmatory because subject selection depended on FreeSurfer-output availability."
+  ],
+  "synthstrip_manifest_provenance_sha256": "2ae0ead67386a589e4acf7f4bb70bb76dfe6d0266622973bf11bfc4cac4cff33",
+  "synthstrip_manifest_sha256": "41291c19ceb677325fe10069bbe576e04a8ed098a7ffdedd497bb2ac180d212a"
+}

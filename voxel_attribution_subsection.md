@@ -1,182 +1,81 @@
-# Voxel Attribution Maps — LaTeX Subsection
+# Voxel Attribution: Confirmatory Methods, Results, and Limitations
 
-Append after `\subsection{Weight initialization}`.
+## Methods
 
-```latex
-\subsection{Voxel Attribution Maps}
+The six-aggregation, ten-seed voxel-attribution sweep was designated
+exploratory. Confirmatory validation uses controlled spatial injections as
+the primary ground truth. NKI and PPMI subjects are assigned deterministically
+to disjoint pilot and validation splits, with balanced synthetic injected and
+control groups. Smooth multiplicative attenuation is applied bilaterally to
+putamen, hippocampus, superior-frontal cortex, or cerebellar white matter in
+the raw T1 image, using a two-voxel internal taper. Scaling and all T1,
+local-rank, and Sobel channels are recomputed after injection.
 
-To identify which brain regions contribute most to the CNN feature embedding,
-we project feature-level importance weights back to voxel space via gradient
-backpropagation~\cite{simonyan2013deep}.
-Given the frozen network mapping an input volume
-$\mathbf{x} \in \mathbb{R}^{C \times H \times W \times D}$ to a
-$d$-dimensional feature vector $\mathbf{f}(\mathbf{x})$, a vector of
-importance weights $\mathbf{w} \in \mathbb{R}^d$ is first derived by
-associating each feature dimension with a scalar quantity of interest (e.g.\
-a per-feature $t$-statistic or regression coefficient).
+Candidate attenuation amplitudes are 2%, 5%, and 10%. The primary amplitude
+is selected without inspecting attribution maps, using only the pilot split,
+as the candidate nearest regional Cohen's d=0.8. Localization is then
+evaluated on the held-out validation split for `double_conv` and `cov_pool`,
+the `mean` and `annualized_rate` aggregations, ten fixed CNN seeds, and t-stat,
+SHAP, and hybrid feature weights. Primary endpoints are voxel AUROC,
+prevalence-normalized AUPRC, attribution-mass fraction inside the injected
+mask, bilateral target-region rank, and top-five hit rate.
 
-A scalar summary of the feature space is then formed as
-\begin{equation}
-  S(\mathbf{x}) = \sum_{i=1}^{d} w_i \cdot f_i(\mathbf{x}),
-\end{equation}
-and the voxel attribution map is obtained as its gradient with respect to the
-input:
-\begin{equation}
-  \mathbf{G}(\mathbf{x}) = \frac{\partial S}{\partial \mathbf{x}}
-                          = \sum_{i=1}^{d} w_i \frac{\partial f_i}{\partial \mathbf{x}}.
-\end{equation}
-Because all network weights are fixed, this gradient reflects how local
-intensity patterns modulate the weighted feature summary through the frozen
-random basis of the untrained network.
+The cohort null uses 199 label permutations for five fixed `double_conv`
+seeds and retains the aggregated regional statistic from every permutation.
+One-sided empirical p-values use the Monte Carlo +1 correction; adjusted
+p-values compare each observed statistic with the permutation maximum across
+regions. Leave-one-permutation-out pseudo-null evaluations estimate the maxT
+family-wise false-positive rate. Unit feature weights on the mean brain, a
+constant masked input, and a phase-scrambled input quantify architecture and
+input priors. Boundary bias is analyzed with each region's boundary-voxel
+fraction, log volume, and tissue class rather than by excluding selected
+named regions.
 
-Two complementary maps are derived from $\mathbf{G}$: the \emph{signed map}
-$\bar{G} = \mathrm{mean}_c\,G_c$ retains sign, indicating whether a voxel
-increases or decreases the scalar $S$; the \emph{absolute map}
-$|\bar{G}| = \mathrm{mean}_c\,|G_c|$ captures total voxel sensitivity
-regardless of direction.
-Both maps are projected to brain regions by averaging voxel values within each
-parcel of the FreeSurfer Desikan--Killiany \texttt{aparc+aseg} atlas, yielding
-a per-region importance ranking that can be compared against volumetric effect
-sizes derived from classical region-of-interest analysis.
-```
+FreeSurfer ROI concordance is secondary because ROI effects and voxel
+attributions describe different models. Raw, null-excess, and
+empirical-standardized regional scores are reported with seed-bootstrap
+intervals and permutations stratified jointly by hemisphere, tissue class,
+and region-volume quintile. ROI concordance is not a decision gate.
 
-## Results (draft — for review, not yet polished for submission)
+## Exploratory results
 
-Computed from the completed Phase 4b full sweep (`brainage_agg/outputs/` /
-`brainage_agg/ppmi_outputs/` under `group_diff/voxel_importance/`; NKI
-Child-vs-Adult, PPMI PD-vs-HC; 10 CNN seeds; group_perm null correction,
-10 permutations). Region-level agreement between the CNN attribution map
-(mean |attribution|) and the classical FreeSurfer ROI effect size
-(max |Cohen's d| per region) across all 6 aggregations × 3 weight-derivation
-methods × 2 datasets:
+Null correction reduced—but did not eliminate—the dominant edge prior:
+cerebellar or corpus-callosum regions were top-ranked in 23/36 raw cells and
+11/36 corrected cells. Across the corrected exploratory sweep, mean Pearson
+ROI correlations were negative for t-stat (-0.269), SHAP (-0.127), and hybrid
+(-0.098) weights. These results do not validate biological localization.
 
-*(updated 2026-07-23 after the corrected re-run, job 319349 — see below; all
-rows are current except NKI/lme_slope/hybrid, still stale, see caveat 3)*
+The previously incomplete NKI `lme_slope/hybrid` cell has now completed for
+50 subjects and ten seeds. Among 106 matched regions, Pearson correlation
+with FreeSurfer ROI effect magnitude was 0.262 for the raw absolute score,
+0.268 for null-excess absolute score, and 0.450 for the empirical-standardized
+absolute score. The raw top region was Right-Pallidum. This single completed
+exploratory cell does not change the confirmatory decision policy and is not
+interpreted as biological validation.
 
-| Dataset | Aggregation | Weight | n | Pearson r | Spearman rho | Top region (mean abs attr) |
-|---|---|---|---|---|---|---|
-| NKI | mean | tstat | 105 | 0.175 | 0.141 | ctx-rh-rostralmiddlefrontal |
-| NKI | mean | shap | 105 | 0.210 | 0.244 | Right-Cerebellum-White-Matter |
-| NKI | mean | hybrid | 105 | 0.072 | 0.044 | ctx-rh-parsopercularis |
-| NKI | concatenation | tstat | 106 | 0.062 | 0.086 | Right-Cerebellum-Cortex |
-| NKI | concatenation | shap | 106 | 0.041 | -0.098 | ctx-lh-supramarginal |
-| NKI | concatenation | hybrid | 106 | 0.196 | 0.235 | Right-Cerebellum-White-Matter |
-| NKI | annualized_rate | tstat | 106 | -0.103 | -0.073 | Right-Cerebellum-Cortex |
-| NKI | annualized_rate | shap | 106 | -0.111 | -0.061 | Right-Cerebellum-Cortex |
-| NKI | annualized_rate | hybrid | 106 | 0.024 | 0.215 | Right-Cerebellum-Cortex |
-| NKI | lme_slope | tstat | 106 | 0.022 | -0.038 | Right-Cerebellum-White-Matter |
-| NKI | lme_slope | shap | 106 | 0.099 | 0.106 | Right-Cerebellum-Cortex |
-| NKI | lme_slope | hybrid | 106 | **STALE — re-run in flight (job 322562)** | | Left-Lateral-Ventricle |
-| NKI | difference | tstat | 106 | -0.107 | -0.050 | Right-Cerebellum-Cortex |
-| NKI | difference | shap | 106 | 0.177 | 0.216 | ctx-lh-frontalpole |
-| NKI | difference | hybrid | 106 | -0.062 | 0.052 | Right-Cerebellum-Cortex |
-| NKI | lme_slope_change | tstat | 106 | 0.030 | -0.041 | Right-Cerebellum-White-Matter |
-| NKI | lme_slope_change | shap | 106 | 0.070 | 0.016 | ctx-lh-frontalpole |
-| NKI | lme_slope_change | hybrid | 106 | -0.120 | -0.129 | Left-choroid-plexus |
-| PPMI | mean | tstat | 109 | -0.124 | -0.212 | ctx-lh-supramarginal |
-| PPMI | mean | shap | 109 | -0.598 | -0.645 | CC_Central |
-| PPMI | mean | hybrid | 109 | 0.227 | 0.267 | ctx-lh-inferiorparietal |
-| PPMI | concatenation | tstat | 109 | -0.095 | -0.141 | ctx-lh-supramarginal |
-| PPMI | concatenation | shap | 109 | -0.589 | -0.614 | CC_Anterior |
-| PPMI | concatenation | hybrid | 109 | 0.222 | 0.287 | ctx-lh-inferiorparietal |
-| PPMI | annualized_rate | tstat | 109 | 0.043 | 0.118 | Right-Cerebellum-Cortex |
-| PPMI | annualized_rate | shap | 109 | -0.449 | -0.441 | CC_Mid_Posterior |
-| PPMI | annualized_rate | hybrid | 109 | 0.118 | 0.286 | Left-Cerebellum-White-Matter |
-| PPMI | lme_slope | tstat | 109 | 0.354 | 0.367 | ctx-lh-frontalpole |
-| PPMI | lme_slope | shap | 109 | -0.464 | -0.476 | CC_Posterior |
-| PPMI | lme_slope | hybrid | 109 | 0.098 | 0.191 | Right-Cerebellum-Cortex |
-| PPMI | difference | tstat | 109 | -0.027 | 0.054 | Left-Cerebellum-Cortex |
-| PPMI | difference | shap | 109 | -0.453 | -0.455 | CC_Mid_Posterior |
-| PPMI | difference | hybrid | 109 | 0.100 | 0.225 | Left-Cerebellum-Cortex |
-| PPMI | lme_slope_change | tstat | 109 | 0.354 | 0.367 | ctx-lh-frontalpole |
-| PPMI | lme_slope_change | shap | 109 | -0.464 | -0.476 | CC_Posterior |
-| PPMI | lme_slope_change | hybrid | 109 | 0.098 | 0.191 | Right-Cerebellum-Cortex |
+## Confirmatory decision policy
 
-**Headline finding: agreement between the CNN attribution maps and classical
-ROI effect sizes is weak overall**, and inconsistent in sign. Mean Pearson r
-across the 35 defined cells (all but the still-stale NKI/lme_slope/hybrid
-row) is +0.05 (tstat), +0.09 (hybrid), and **-0.21 (shap)** — i.e. the
-SHAP-derived weights are, on average, *anti*-correlated with where the
-classical ROI analysis finds effects, most strongly so on PPMI (r down to
--0.60 for `mean`/shap). This does not by itself show the CNN attribution is
-wrong — a frozen, untrained CNN has no reason to rediscover the same
-effect-size ranking as a linear ROI model — but it means the "CNN vs ROI
-agreement" comparison **cannot currently be reported as a positive
-validation of the attribution method** without further caveats.
+Localization passes only if, at the calibrated amplitude, voxel AUROC is at
+least 0.75 with bootstrap lower bound above 0.50, normalized AUPRC lift is at
+least 2 with lower bound above 1, and bilateral top-five hit rate is at least
+80%. Null calibration additionally requires a maxT family-wise false-positive
+rate no greater than 5% with 95% upper bound no greater than 10%. Target
+specificity requires within-target map similarity to exceed both
+between-target similarity and similarity to the unit-weight prior, with
+paired-bootstrap lower bounds above zero. General claims require all three
+gates in both cohorts and both architectures.
 
-Four things to resolve before these numbers go in a paper draft:
+Until these gates pass, voxel attribution is described only as an
+architecture/preprocessing diagnostic and highlighted regions are not
+interpreted biologically.
 
-1. **Cerebellum / corpus-callosum dominance.** 22 of the 36 (61%) top-attributed
-   regions above are cerebellar or corpus-callosum labels — both are boundary
-   regions prone to partial-volume and registration artifacts, and sit near
-   the edge of the intracranial mask. Their disproportionate share of "top
-   region by mean |attribution|" is more consistent with an architecture/edge
-   gradient bias (of the kind the permutation-null correction is meant to
-   remove) than with a genuine group-difference signal. Worth checking
-   whether the null correction is fully suppressing this before trusting the
-   region ranking.
-2. **`w_hybrid` is degenerate across most of the sweep, not just two cells.**
-   The two NKI cells above are constant (Pearson/Spearman undefined) because
-   *every* seed's permutation importance collapsed to all-zero — confirmed
-   from the sweep logs (`phase4b_284815_{3,5}.out`: `imp_nonzero_frac=0.000`,
-   `train_acc=1.000`, 10/10 seeds). Pulling `imp_nonzero_frac` across all
-   12 array-task logs shows this isn't isolated: **83 of 120 hybrid RF fits
-   sweep-wide (69%) hit `imp_nonzero_frac=0.000`**, ranging from 2/10 seeds
-   (task 2) to 10/10 (tasks 3, 5).
+## Limitations
 
-   **Root cause identified and fixed** (2026-07-16,
-   `importance_weights.compute_w_hybrid`): the problem was never RF
-   regularization (`min_samples_leaf=5` was already in place and didn't
-   help) — it was the `scoring="accuracy"` argument to
-   `sklearn.inspection.permutation_importance`. With train_acc=1.0 and
-   high-confidence `predict_proba` margins (typical at d up to 23,040,
-   n≈50-250), a single permuted feature essentially never flips a 0/1
-   accuracy outcome, so importances round to exactly zero regardless of
-   whether the feature is informative. A matched synthetic benchmark (same
-   RF hyperparameters, real injected signal) confirmed `scoring="roc_auc"`
-   has the identical failure mode, while `scoring="neg_log_loss"` (continuous
-   in `predict_proba`, sensitive to sub-threshold shifts) raised
-   `imp_nonzero_frac` from 0.000 to 0.36-0.95 with *no other change*.
-   `compute_w_hybrid` now uses `scoring="neg_log_loss"`.
-
-   **Confirmed fixed by the 2026-07-16 re-run (job 319349):** `imp_nonzero_frac`
-   is nonzero in all 120/120 seed-level RF fits sweep-wide (was 83/120 fully
-   degenerate before). The corrected `hybrid` numbers are now in the table
-   above, except NKI/lme_slope (see caveat 3).
-3. **A separate GPU-oversubscription bug silently discarded one cell's data.**
-   Task 3 of job 319349 (NKI `lme_slope`) still shows a constant/all-zero
-   `hybrid` map in the table above despite the fix, because this cluster's
-   only GPU node (`cgpu01`) has no SLURM GRES/GPU accounting configured
-   (`scontrol show node cgpu01` → `Gres=(null)`), so the scheduler doesn't
-   stop multiple array tasks landing on the same physical GPU. Four tasks
-   landed on it at once, each needing ~4.3GB against a 14.58GB card; task 3's
-   run hit CUDA OOM on every subject's gradient computation, logged
-   "No attribution maps produced for 'lme_slope' — skipping", and **still
-   exited 0/COMPLETED** — this failure mode does not show up as a failed
-   SLURM job, only as stale output timestamps/values. Fixed by throttling the
-   array to 2 concurrent tasks (`--array=0-11%2` in
-   `submit_phase4b_full_sweep.sh`); task 3 alone was resubmitted
-   (`sbatch --array=3 ...`, job 322562) and is in flight as of this writing.
-   Re-check `phase4b_*.out` logs for "CUDA out of memory" / "No attribution
-   maps produced" after any future sweep run, since a clean SLURM exit status
-   does not guarantee valid output.
-4. **`lme_slope` and `lme_slope_change` rows are numerically identical**
-   (both datasets, all three weight types) — this is expected, not a bug:
-   `aggregations.lme_slope_change` is defined (`brainage_agg/agg/aggregations.py:112-123`)
-   to return the *same* per-subject BLUP slope as `lme_slope`; Arm A vs Arm B
-   differ only in the downstream age-prediction *target* (absolute age vs.
-   Δt), not in the feature descriptor. Voxel attribution is derived from the
-   feature matrix and group labels alone, so identical features →
-   identical attribution maps. Worth a one-line footnote in the writeup so a
-   reviewer doesn't flag it as a duplication bug the way it first looked here.
-
-## BibTeX entry to add
-
-```bibtex
-@article{simonyan2013deep,
-  title   = {Deep Inside Convolutional Networks: Visualising Image Classification Models and Saliency Maps},
-  author  = {Simonyan, Karen and Vedaldi, Andrea and Zisserman, Andrew},
-  journal = {arXiv preprint arXiv:1312.6034},
-  year    = {2013},
-}
-```
+Synthetic attenuation is a localization ground truth, not a complete model of
+neurodegeneration or development. The cerebellar white-matter target is an
+adversarial test of a known edge-sensitive prior and must not be read as
+evidence for cerebellar biology. Atlas boundaries and tissue contrast can
+still influence gradients after null correction. Finally, successful
+technical localization would establish sensitivity to controlled effects,
+not biological validity; biological concordance remains a separate empirical
+question.
